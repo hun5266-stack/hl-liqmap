@@ -2,17 +2,17 @@ name: collect
 
 on:
   schedule:
-    # 매시 05분. 정시는 러너 부하가 몰려 지연이 커진다.
+    # 매시 05분 전수 스캔. 정시는 러너 부하가 몰려 지연이 커진다.
+    # 한 번에 약 18분이라 다음 실행까지 40분 이상 여유가 있다.
     - cron: "5 * * * *"
-    # 매일 03:20 UTC 전수 스캔으로 명단 갱신
-    - cron: "20 3 * * *"
   workflow_dispatch:
     inputs:
-      full:
-        description: "전수 스캔 실행"
+      known_only:
+        description: "전수 대신 기존 명단만 재조회 (빠름)"
         type: boolean
         default: false
 
+# 전수 스캔이 길어져 다음 실행과 겹치면 건너뛰지 않고 기다린다.
 concurrency:
   group: collect
   cancel-in-progress: false
@@ -23,7 +23,7 @@ permissions:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -33,10 +33,10 @@ jobs:
 
       - name: 수집
         run: |
-          if [ "${{ github.event.schedule }}" = "20 3 * * *" ] || [ "${{ inputs.full }}" = "true" ]; then
-            python collect.py --full
-          else
+          if [ "${{ inputs.known_only }}" = "true" ]; then
             python collect.py
+          else
+            python collect.py --full
           fi
 
       - name: 커밋
@@ -48,7 +48,6 @@ jobs:
             echo "변경 없음"
           else
             git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
-            # 다른 실행이 먼저 푸시했으면 리베이스 후 재시도
             for i in 1 2 3; do
               git pull --rebase --autostash origin main && git push origin main && exit 0
               sleep 5

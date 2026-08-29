@@ -5,9 +5,8 @@
   --full   리더보드 전체를 훑어 BTC 보유 계정 명단(holders.json)을 갱신한다. 약 18분.
   (기본)   holders.json 의 계정만 재조회한다. 약 70초.
 
-매시간 기본 모드로 찍고 하루 한 번 --full 로 명단을 새로 만드는 조합을 상정한다.
-전수를 매시간 돌리면 하루 7시간을 스캔에 쓰게 되고, 명단만 재조회하면
-그 사이 새로 진입한 계정을 놓치기 때문이다.
+매시간 --full 로 돈다. 공개 레포는 Actions 무료 분 제한이 없어
+전수를 매번 돌려도 비용이 들지 않는다. 기본 모드는 수동 실행용으로 남겨둔다.
 
 저장 형식은 gzip CSV다. 스냅샷 하나가 수십 KB라 몇 달 쌓아도 레포가 감당한다.
 """
@@ -169,9 +168,22 @@ def main():
     elapsed = time.time() - t0
 
     if mode == "full":
-        with open(HOLDERS, "w", encoding="utf-8") as f:
-            json.dump({"updated": datetime.now(timezone.utc).isoformat(),
-                       "addresses": [r["a"] for r in rows]}, f)
+        # 스캔이 중간에 깨지면 결과가 잘린 채로 명단을 덮어쓸 수 있다.
+        # 직전 명단보다 크게 줄었으면 갱신을 건너뛴다.
+        prev_n = 0
+        if os.path.exists(HOLDERS):
+            try:
+                with open(HOLDERS, encoding="utf-8") as f:
+                    prev_n = len(json.load(f)["addresses"])
+            except Exception:
+                prev_n = 0
+        if prev_n and len(rows) < prev_n * 0.7:
+            print(f"  [경고] BTC 포지션 {len(rows):,}개가 직전 {prev_n:,}개보다 30% 이상 적다. "
+                  f"명단 갱신을 건너뛴다")
+        else:
+            with open(HOLDERS, "w", encoding="utf-8") as f:
+                json.dump({"updated": datetime.now(timezone.utc).isoformat(),
+                           "addresses": [r["a"] for r in rows]}, f)
 
     path, s = write_snapshot(rows, px, mode, elapsed, len(addrs))
     print(f"[{s['ts']}] mode={mode} px=${px:,.0f} scanned={len(addrs):,} "
