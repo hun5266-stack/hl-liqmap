@@ -1,0 +1,57 @@
+name: collect
+
+on:
+  schedule:
+    # 매시 05분. 정시는 러너 부하가 몰려 지연이 커진다.
+    - cron: "5 * * * *"
+    # 매일 03:20 UTC 전수 스캔으로 명단 갱신
+    - cron: "20 3 * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "전수 스캔 실행"
+        type: boolean
+        default: false
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 수집
+        run: |
+          if [ "${{ github.event.schedule }}" = "20 3 * * *" ] || [ "${{ inputs.full }}" = "true" ]; then
+            python collect.py --full
+          else
+            python collect.py
+          fi
+
+      - name: 커밋
+        run: |
+          git config user.name  "hl-liqmap bot"
+          git config user.email "actions@github.com"
+          git add data latest.json holders.json
+          if git diff --staged --quiet; then
+            echo "변경 없음"
+          else
+            git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+            # 다른 실행이 먼저 푸시했으면 리베이스 후 재시도
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin main && git push origin main && exit 0
+              sleep 5
+            done
+            exit 1
+          fi
