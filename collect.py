@@ -45,11 +45,23 @@ def post(body, tries=3):
 
 
 def btc_price():
-    req = urllib.request.Request(
-        "https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT",
-        headers={"User-Agent": UA["User-Agent"]})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return float(json.load(r)["price"])
+    """하이퍼리퀴드 마크가를 쓴다.
+
+    바이낸스는 GitHub Actions 러너 IP(미국)를 지역 차단해 451을 준다.
+    그리고 청산가를 계산하는 주체가 하이퍼리퀴드이므로, 기준 가격도
+    같은 곳에서 받아야 지도와 가격이 어긋나지 않는다.
+    """
+    d = post({"type": "metaAndAssetCtxs"})
+    if d:
+        try:
+            i = next(k for k, u in enumerate(d[0]["universe"]) if u["name"] == "BTC")
+            return float(d[1][i]["markPx"])
+        except (StopIteration, KeyError, TypeError, ValueError):
+            pass
+    d = post({"type": "allMids"})
+    if d and "BTC" in d:
+        return float(d["BTC"])
+    raise RuntimeError("BTC 가격 조회 실패")
 
 
 def leaderboard():
