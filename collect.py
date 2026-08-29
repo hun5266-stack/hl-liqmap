@@ -3,7 +3,7 @@
 
 두 가지 모드로 돈다.
   --full   리더보드 전체를 훑어 BTC 보유 계정 명단(holders.json)을 갱신한다. 약 18분.
-  (기본)   holders.json 의 계정만 재조회한다. 약 35초.
+  (기본)   holders.json 의 계정만 재조회한다. 약 70초.
 
 매시간 기본 모드로 찍고 하루 한 번 --full 로 명단을 새로 만드는 조합을 상정한다.
 전수를 매시간 돌리면 하루 7시간을 스캔에 쓰게 되고, 명단만 재조회하면
@@ -28,9 +28,6 @@ UA = {"User-Agent": "hl-liqmap/1.0", "Content-Type": "application/json"}
 ROOT = os.path.dirname(os.path.abspath(__file__))
 HOLDERS = os.path.join(ROOT, "holders.json")
 
-# 청산가가 현재가에서 이만큼 밖이면 저장하지 않는다. 검증 대상이 아니고
-# 전부 담으면 스냅샷이 몇 배로 불어난다.
-KEEP_PCT = 25.0
 WORKERS = 14
 
 
@@ -107,18 +104,19 @@ def write_snapshot(rows, px, mode, elapsed, scanned):
     name = ts.strftime("%Y%m%dT%H%M") + ("_full" if mode == "full" else "") + ".csv.gz"
     path = os.path.join(outdir, name)
 
-    lo, hi = px * (1 - KEEP_PCT / 100), px * (1 + KEEP_PCT / 100)
-    near = [r for r in rows if r["liq"] and lo <= r["liq"] <= hi]
-
+    # 필터를 두지 않는다. 3주를 모으는 동안 가격이 15~20% 움직이면
+    # 오늘 먼 청산가가 나중엔 가까워진다. 그때 데이터가 없으면 소급이 안 되고,
+    # 전량 저장해도 스냅샷이 120KB 남짓이라 아낄 이유가 없다.
     buf = io.StringIO()
     w = csv.writer(buf)
     # 첫 줄은 스냅샷 메타. 실제 실행 시각을 남겨야 나중에 지연을 보정할 수 있다.
     w.writerow(["#ts", ts.isoformat(), "px", f"{px:.2f}", "mode", mode,
                 "scanned", scanned, "btc_positions", len(rows),
-                "kept", len(near), "elapsed_s", f"{elapsed:.0f}"])
+                "elapsed_s", f"{elapsed:.0f}"])
     w.writerow(["addr", "size", "entry", "liq", "lev", "margin", "pnl", "acct_value"])
-    for r in near:
-        w.writerow([r["a"], f"{r['sz']:.6f}", f"{r['ep']:.2f}", f"{r['liq']:.2f}",
+    for r in rows:
+        w.writerow([r["a"], f"{r['sz']:.6f}", f"{r['ep']:.2f}",
+                    f"{r['liq']:.2f}" if r["liq"] else "",
                     r["lev"], r["mt"], f"{r['pnl']:.2f}", f"{r['av']:.2f}"])
 
     with gzip.open(path, "wt", encoding="utf-8", newline="") as f:
@@ -128,7 +126,7 @@ def write_snapshot(rows, px, mode, elapsed, scanned):
     shorts = [r for r in rows if r["sz"] < 0]
     summary = {
         "ts": ts.isoformat(), "price": px, "mode": mode,
-        "scanned": scanned, "btc_positions": len(rows), "kept_near": len(near),
+        "scanned": scanned, "btc_positions": len(rows),
         "long_btc": round(sum(r["sz"] for r in longs), 2),
         "short_btc": round(sum(-r["sz"] for r in shorts), 2),
         "long_n": len(longs), "short_n": len(shorts),
@@ -165,7 +163,7 @@ def main():
 
     path, s = write_snapshot(rows, px, mode, elapsed, len(addrs))
     print(f"[{s['ts']}] mode={mode} px=${px:,.0f} scanned={len(addrs):,} "
-          f"btc={len(rows):,} kept={s['kept_near']:,} {elapsed:.0f}s")
+          f"btc={len(rows):,} {elapsed:.0f}s")
     print(f"  long {s['long_btc']:,.0f} BTC / short {s['short_btc']:,.0f} BTC")
     print(f"  -> {os.path.relpath(path, ROOT)}")
 
