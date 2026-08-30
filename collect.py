@@ -27,7 +27,13 @@ UA = {"User-Agent": "hl-liqmap/1.0", "Content-Type": "application/json"}
 ROOT = os.path.dirname(os.path.abspath(__file__))
 HOLDERS = os.path.join(ROOT, "holders.json")
 
-WORKERS = 14
+# 14 → 36. 전수 스캔이 22분에서 5분대로 줄어 스케줄 겹침이 사라진다.
+# 48까지 올려도 429 없이 돌지만 이득이 작아 36에서 멈췄다.
+WORKERS = 36
+
+# 스케줄을 여러 번 걸어두고 중복은 여기서 막는다. 직전 스냅샷이
+# 이보다 최근이면 그냥 종료한다.
+MIN_GAP_MIN = 45
 
 
 def post(body, tries=3):
@@ -148,10 +154,36 @@ def write_snapshot(rows, px, mode, elapsed, scanned):
     return path, summary
 
 
+def last_snapshot_age_min():
+    """가장 최근 스냅샷이 몇 분 전인지. 없으면 None."""
+    base = os.path.join(ROOT, "data")
+    if not os.path.isdir(base):
+        return None
+    names = []
+    for d in os.listdir(base):
+        p = os.path.join(base, d)
+        if os.path.isdir(p):
+            names += [n for n in os.listdir(p) if n.endswith(".csv.gz")]
+    if not names:
+        return None
+    stamp = max(n.split("_")[0].replace(".csv.gz", "") for n in names)
+    try:
+        t = datetime.strptime(stamp, "%Y%m%dT%H%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - t).total_seconds() / 60
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true", help="리더보드 전체 스캔 후 명단 갱신")
+    ap.add_argument("--force", action="store_true", help="간격 무시하고 강제 실행")
     a = ap.parse_args()
+
+    age = last_snapshot_age_min()
+    if age is not None and age < MIN_GAP_MIN and not a.force:
+        print(f"직전 스냅샷이 {age:.0f}분 전이다 (최소 간격 {MIN_GAP_MIN}분). 건너뛴다")
+        return
 
     t0 = time.time()
     px = btc_price()

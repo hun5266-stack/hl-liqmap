@@ -2,13 +2,21 @@ name: collect
 
 on:
   schedule:
-    # 매시 05분 전수 스캔. 정시는 러너 부하가 몰려 지연이 커진다.
-    # 한 번에 약 18분이라 다음 실행까지 40분 이상 여유가 있다.
-    - cron: "5 * * * *"
+    # GitHub 무료 스케줄러는 실행을 보장하지 않는다. 실측으로 절반 이상을
+    # 건너뛰었고 공백이 7시간까지 벌어졌다. 시간당 네 번 걸어 잡힐 확률을 올리고,
+    # 중복은 collect.py 의 MIN_GAP_MIN(45분)이 막는다.
+    - cron: "7 * * * *"
+    - cron: "22 * * * *"
+    - cron: "37 * * * *"
+    - cron: "52 * * * *"
   workflow_dispatch:
     inputs:
       known_only:
         description: "전수 대신 기존 명단만 재조회 (빠름)"
+        type: boolean
+        default: false
+      force:
+        description: "최소 간격 무시하고 강제 실행"
         type: boolean
         default: false
 
@@ -23,7 +31,7 @@ permissions:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -33,11 +41,10 @@ jobs:
 
       - name: 수집
         run: |
-          if [ "${{ inputs.known_only }}" = "true" ]; then
-            python collect.py
-          else
-            python collect.py --full
-          fi
+          ARGS=""
+          [ "${{ inputs.known_only }}" != "true" ] && ARGS="$ARGS --full"
+          [ "${{ inputs.force }}" = "true" ] && ARGS="$ARGS --force"
+          python collect.py $ARGS
 
       - name: 커밋
         run: |
