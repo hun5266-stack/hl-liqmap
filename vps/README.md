@@ -13,10 +13,11 @@ ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N ""
 # 출력된 공개키를 레포 Settings > Deploy keys 에 write 권한으로 등록
 git clone git@github.com:hun5266-stack/hl-liqmap.git /root/hl-liqmap
 cp /root/hl-liqmap/vps/run.sh /root/run.sh && chmod +x /root/run.sh
-printf 'SHELL=/bin/bash
+crontab - <<'CRON'
+SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 * * * * /root/run.sh
-' > /tmp/ct && crontab /tmp/ct
+CRON
 ```
 
 로그는 `/var/log/hl-liqmap.log`.
