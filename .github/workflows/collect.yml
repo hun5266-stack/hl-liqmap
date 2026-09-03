@@ -2,9 +2,9 @@ name: collect
 
 on:
   schedule:
-    # GitHub 무료 스케줄러는 실행을 보장하지 않는다. 실측으로 절반 이상을
-    # 건너뛰었고 공백이 7시간까지 벌어졌다. 시간당 네 번 걸어 잡힐 확률을 올리고,
-    # 중복은 collect.py 의 MIN_GAP_MIN(45분)이 막는다.
+    # 백업 역할이다. 정시 수집은 도쿄 VPS 가 맡는다.
+    # GitHub 무료 스케줄러는 실행을 보장하지 않아 실측 수집률이 40% 안팎이었다.
+    # 네 번 걸어 잡힐 확률을 올리고, VPS 가 정상일 때는 --min-gap 70 이 전부 걸러낸다.
     - cron: "7 * * * *"
     - cron: "22 * * * *"
     - cron: "37 * * * *"
@@ -44,20 +44,34 @@ jobs:
           ARGS=""
           [ "${{ inputs.known_only }}" != "true" ] && ARGS="$ARGS --full"
           [ "${{ inputs.force }}" = "true" ] && ARGS="$ARGS --force"
-          python collect.py $ARGS
+          python collect.py $ARGS --min-gap 70
 
       - name: 커밋
         run: |
           git config user.name  "hl-liqmap bot"
           git config user.email "actions@github.com"
-          git add data latest.json holders.json
+          git add -A data latest.json holders.json
           if git diff --staged --quiet; then
             echo "변경 없음"
-          else
-            git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
-            for i in 1 2 3; do
-              git pull --rebase --autostash origin main && git push origin main && exit 0
-              sleep 5
-            done
-            exit 1
+            exit 0
           fi
+          MSG="snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "$MSG"
+          # 리베이스를 쓰지 않는다. latest.json 과 holders.json 은 실행할 때마다
+          # 새로 쓰이므로 다른 주체가 먼저 푸시했으면 반드시 충돌한다.
+          # 거부되면 새 파일만 최신 위에 다시 얹는다.
+          for i in 1 2 3; do
+            git push -q origin main && exit 0
+            echo "푸시 거부 — 재정렬 $i"
+            T=$(mktemp -d)
+            cp -a data latest.json holders.json "$T"/
+            git fetch -q origin
+            git reset -q --hard origin/main
+            cp -a "$T"/data/. data/
+            cp -a "$T"/latest.json "$T"/holders.json .
+            rm -rf "$T"
+            git add -A data latest.json holders.json
+            git diff --staged --quiet || git commit -q -m "$MSG"
+            sleep 5
+          done
+          exit 1

@@ -38,8 +38,14 @@ HOLDERS = os.path.join(ROOT, "holders.json")
 # 나중에 소급할 방법이 없다.
 WORKERS = 36
 
-# 스케줄을 여러 번 걸어두고 중복은 여기서 막는다. 직전 스냅샷이
-# 이보다 최근이면 그냥 종료한다.
+# 중복 실행을 막는 기본 간격. 실행 주체마다 달라서 --min-gap 으로 덮어쓴다.
+#
+# VPS 는 정시 슬롯의 주인이라 40분을 쓴다. 전수 스캔이 18분 걸려 스냅샷이
+# HH:18 에 찍히고 다음 정시에는 42분 전으로 보인다. 기본값 45분이면 매번
+# 걸러져 두 시간에 한 번밖에 못 돈다.
+#
+# Actions 는 백업이라 70분을 쓴다. VPS 가 정상이면 항상 걸러지고,
+# VPS 가 슬롯을 놓쳤을 때만 깨어난다.
 MIN_GAP_MIN = 45
 
 
@@ -185,11 +191,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true", help="리더보드 전체 스캔 후 명단 갱신")
     ap.add_argument("--force", action="store_true", help="간격 무시하고 강제 실행")
+    ap.add_argument("--min-gap", type=int, default=MIN_GAP_MIN,
+                    help="직전 스냅샷과의 최소 간격(분)")
     a = ap.parse_args()
 
     age = last_snapshot_age_min()
-    if age is not None and age < MIN_GAP_MIN and not a.force:
-        print(f"직전 스냅샷이 {age:.0f}분 전이다 (최소 간격 {MIN_GAP_MIN}분). 건너뛴다")
+    if age is not None and age < a.min_gap and not a.force:
+        print(f"직전 스냅샷이 {age:.0f}분 전이다 (최소 간격 {a.min_gap}분). 건너뛴다")
         return
 
     t0 = time.time()
