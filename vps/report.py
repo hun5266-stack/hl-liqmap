@@ -14,7 +14,7 @@ import json
 import os
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import matplotlib
 matplotlib.use("Agg")
@@ -38,6 +38,15 @@ for _f in ("Malgun Gothic", "NanumGothic", "Noto Sans CJK KR"):
         plt.rcParams["font.family"] = _f
         break
 plt.rcParams["axes.unicode_minus"] = False
+
+# 저장은 UTC 로 한다 (파일명·메타 모두). 보여줄 때만 한국시간으로 바꾼다.
+KST = timezone(timedelta(hours=9))
+
+
+def kst(dt):
+    """표시용 한국시간. tzinfo 를 떼서 matplotlib 이 다시 변환하지 않게 한다."""
+    return dt.astimezone(KST).replace(tzinfo=None)
+
 
 PLANE = [(0.08, 0.50), (0.94, 0.82), (0.63, 0.12), (0.44, 0.42)]
 
@@ -159,13 +168,13 @@ def draw(snaps, K, path, days):
     bx = fig.add_subplot(gs[1], sharey=ax)
     cax = fig.add_subplot(gs[2])
 
-    tn = mdates.date2num(ts)
+    tn = mdates.date2num([kst(t) for t in ts])
     ex = np.concatenate([[tn[0] - 0.02], (tn[:-1] + tn[1:]) / 2, [tn[-1] + 0.02]])
     ey = np.concatenate([bins - BIN / 2, [bins[-1] + BIN / 2]])
     pm = ax.pcolormesh(ex, ey, np.clip(G, 0, 420), cmap=cmap, shading="flat")
 
     if K["t"]:
-        kt = mdates.date2num([datetime.fromtimestamp(t / 1000, timezone.utc)
+        kt = mdates.date2num([kst(datetime.fromtimestamp(t / 1000, timezone.utc))
                               for t in K["t"]])
         ax.fill_between(kt, K["l"], K["h"], color="white", alpha=0.30,
                         lw=0, zorder=4)
@@ -182,10 +191,10 @@ def draw(snaps, K, path, days):
     fig.text(0.055, 0.955, "하이퍼리퀴드 BTC 청산가 지도", color="white",
              fontsize=17.5, va="top", weight="bold")
     fig.text(0.055, 0.912,
-             "청산가 = 수집 스냅샷 %d개 (%s ~ %s UTC, 계정 %s개 전수)"
+             "청산가 = 수집 스냅샷 %d개 (%s ~ %s KST, 계정 %s개 전수)"
              "   ·   가격 = 바이낸스 5분봉 %s개"
-             % (len(snaps), ts[0].strftime("%m/%d %H:%M"),
-                ts[-1].strftime("%m/%d %H:%M"),
+             % (len(snaps), kst(ts[0]).strftime("%m/%d %H:%M"),
+                kst(ts[-1]).strftime("%m/%d %H:%M"),
                 format(snaps[-1]["scanned"], ","), format(len(K["t"]), ",")),
              color="#8f97a6", fontsize=10.5, va="top")
     fig.text(0.055, 0.882,
@@ -215,7 +224,7 @@ def draw(snaps, K, path, days):
                 xycoords="axes fraction", color="#7b8494", fontsize=9,
                 ha="right", va="top")
     bx.set_facecolor(BG)
-    bx.set_title("최신 단면 · %s" % ts[-1].strftime("%m/%d %H:%M"),
+    bx.set_title("최신 단면 · %s KST" % kst(ts[-1]).strftime("%m/%d %H:%M"),
                  color="#c8cdd6", fontsize=11, pad=10, loc="left")
     bx.set_xlabel("BTC", color="#8f97a6", fontsize=10)
     bx.tick_params(colors="#78808f", labelleft=False)
@@ -475,12 +484,12 @@ def alerts(snaps, K, cur, hours=24):
     if liq:
         out.append("**청산 흔적** $%s~%s 칸을 가격이 통과했고 %s → %s BTC 로 빠졌다. "
                    "%d개 계정 중 %s BTC 는 포지션이 사라졌고 %s BTC 는 청산가만 옮겼다. "
-                   "(%s UTC)"
+                   "(%s KST)"
                    % (format(liq["bin"], ","), format(liq["bin"] + BIN, ","),
                       format(liq["before"], ",.0f"),
                       format(liq["after"], ",.0f"), liq["n"],
                       format(liq["gone"], ",.0f"), format(liq["moved"], ",.0f"),
-                      liq["t"].strftime("%m/%d %H:%M")))
+                      kst(liq["t"]).strftime("%m/%d %H:%M")))
 
     # ② 없던 자리에 새로 생긴 군집
     fresh = [(b, v) for b, v in vn.items() if v >= 200 and v0.get(b, 0) < 50]
@@ -563,8 +572,8 @@ def summary(snaps, cur, extra=None):
     L = [p for p in s["pos"] if p[0] > 0]
     S = [p for p in s["pos"] if p[0] < 0]
 
-    out = ["**BTC $%s**  (%+.2f%% / 1h)   ·   %s UTC"
-           % (format(cur, ",.0f"), chg, s["ts"].strftime("%m-%d %H:%M")),
+    out = ["**BTC $%s**  (%+.2f%% / 1h)   ·   %s KST"
+           % (format(cur, ",.0f"), chg, kst(s["ts"]).strftime("%m-%d %H:%M")),
            "```",
            "±2%% 안   위 숏청산 %6s BTC (터지면 매수)   아래 롱청산 %6s BTC (매도)"
            % (format(up2, ",.0f"), format(dn2, ",.0f"))]
