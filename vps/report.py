@@ -398,6 +398,149 @@ def narrate(snaps, K, cur, hours=24):
     return out
 
 
+def bin_vol(snap, cur, span=0.06):
+    """현재가 주변 칸별 물량. (칸 -> BTC)"""
+    c = collections.Counter()
+    for sz, liq in snap["pos"]:
+        if liq is None or abs(liq - cur) / cur > span:
+            continue
+        c[int(liq // BIN) * BIN] += abs(sz)
+    return c
+
+
+def span_range(K, t0, t1):
+    """두 시각 사이 가격이 훑고 간 범위."""
+    hs = [h for t, h in zip(K["t"], K["h"]) if t0 <= t / 1000 < t1]
+    ls = [l for t, l in zip(K["t"], K["l"]) if t0 <= t / 1000 < t1]
+    return (min(ls), max(hs)) if hs else (None, None)
+
+
+def find_liquidation(snaps, K, within_h=24):
+    """가격이 실제로 통과한 칸에서 물량이 사라졌는지 찾는다.
+
+    이 프로젝트가 던진 질문 자체다. 지도에서 물량이 빠지는 것은 흔한데,
+    그중 '가격이 그 자리를 지나갔고 그때 없어진 것' 만이 진짜 청산이다.
+    통과하지 않았는데 빠졌으면 자발적 이탈이다.
+    """
+    best = None
+    cut = snaps[-1]["ts"].timestamp() - within_h * 3600
+    for i in range(len(snaps) - 1):
+        a, b = snaps[i], snaps[i + 1]
+        if b["ts"].timestamp() < cut:      # 최근 것만 소식이다
+            continue
+        lo_p, hi_p = span_range(K, a["ts"].timestamp(), b["ts"].timestamp())
+        if lo_p is None:
+            continue
+        va = bin_vol(a, a["px"], 0.10)
+        for bn, v in va.items():
+            if v < 80:                      # 너무 얇으면 잡음이다
+                continue
+            if not (lo_p <= bn + BIN / 2 <= hi_p):   # 가격이 그 칸을 지났나
+                continue
+            vb = bin_vol(b, b["px"], 0.10).get(bn, 0.0)
+            drop = (v - vb) / v
+            if drop < 0.6:
+                continue
+            if best is None or v * drop > best[0]:
+                best = (v * drop, i, bn, v, vb, a, b)
+    if best is None:
+        return None
+
+    _, _, bn, v, vb, a, b = best
+    A, B = load_full(a["path"]), load_full(b["path"])
+    coh = {k: x for k, x in A.items()
+           if x["liq"] is not None and bn <= x["liq"] < bn + BIN}
+    gone = sum(abs(x["sz"]) for k, x in coh.items()
+               if k not in B or B[k]["sz"] == 0)
+    moved = sum(abs(x["sz"]) for k, x in coh.items()
+                if k in B and B[k]["sz"] != 0
+                and not (B[k]["liq"] is not None
+                         and bn <= B[k]["liq"] < bn + BIN))
+    return {"bin": bn, "before": v, "after": vb, "gone": gone, "moved": moved,
+            "n": len(coh), "t": b["ts"]}
+
+
+def alerts(snaps, K, cur, hours=24):
+    """조건이 맞을 때만 뜨는 것들. 평소에는 아무것도 안 뜬다."""
+    out = []
+    if len(snaps) < 4:
+        return out
+    then = min(snaps, key=lambda s: abs(
+        (snaps[-1]["ts"] - s["ts"]).total_seconds() - hours * 3600))
+    now, prev = snaps[-1], snaps[-2]
+    vn, v0, vp = (bin_vol(now, cur), bin_vol(then, cur), bin_vol(prev, cur))
+
+    # ① 가격이 실제로 지나간 자리에서 물량이 사라졌나 — 진짜 청산
+    liq = find_liquidation(snaps, K)
+    if liq:
+        out.append("**청산 흔적** $%s~%s 칸을 가격이 통과했고 %s → %s BTC 로 빠졌다. "
+                   "%d개 계정 중 %s BTC 는 포지션이 사라졌고 %s BTC 는 청산가만 옮겼다. "
+                   "(%s UTC)"
+                   % (format(liq["bin"], ","), format(liq["bin"] + BIN, ","),
+                      format(liq["before"], ",.0f"),
+                      format(liq["after"], ",.0f"), liq["n"],
+                      format(liq["gone"], ",.0f"), format(liq["moved"], ",.0f"),
+                      liq["t"].strftime("%m/%d %H:%M")))
+
+    # ② 없던 자리에 새로 생긴 군집
+    fresh = [(b, v) for b, v in vn.items() if v >= 200 and v0.get(b, 0) < 50]
+    if fresh:
+        b, v = max(fresh, key=lambda x: x[1])
+        out.append("**새 군집** $%s~%s 에 %s BTC 가 새로 생겼다. 하루 전에는 %s BTC 였다. (%+.1f%%)"
+                   % (format(b, ","), format(b + BIN, ","), format(v, ",.0f"),
+                      format(v0.get(b, 0), ",.0f"), (b - cur) / cur * 100))
+
+    # ③ 한 계정이 그 칸을 사실상 혼자 채우고 있나
+    B = load_full(now["path"])
+    for b, v in sorted(vn.items(), key=lambda x: -x[1])[:3]:
+        if v < 150:
+            break
+        mem = [abs(x["sz"]) for x in B.values()
+               if x["liq"] is not None and b <= x["liq"] < b + BIN]
+        if mem and max(mem) / sum(mem) >= 0.5:
+            out.append("**한 명이 절반** $%s~%s 의 %s BTC 중 %s BTC 가 계정 하나다 (%.0f%%). "
+                       "군집이 아니라 큰 한 명이다."
+                       % (format(b, ","), format(b + BIN, ","), format(v, ",.0f"),
+                          format(max(mem), ",.0f"), max(mem) / sum(mem) * 100))
+            break
+
+    # ④ 위아래 연료 균형이 뒤집혔나
+    def bal(vv, px):
+        u = sum(x for bb, x in vv.items() if px < bb <= px * 1.03)
+        d = sum(x for bb, x in vv.items() if px * 0.97 <= bb < px)
+        return u, d
+    u1, d1 = bal(vn, cur)
+    u0, d0 = bal(v0, then["px"])
+    if min(u1, d1, u0, d0) > 30:
+        if (u0 > d0) != (u1 > d1):
+            out.append("**균형 반전** ±3%% 안 연료가 하루 전 %s(위):%s(아래) 였는데 "
+                       "지금 %s:%s 로 뒤집혔다."
+                       % (format(u0, ",.0f"), format(d0, ",.0f"),
+                          format(u1, ",.0f"), format(d1, ",.0f")))
+
+    # ⑤ 가격이 멀어지는데 오히려 쌓이는 자리
+    for b, v in sorted(vn.items(), key=lambda x: -x[1])[:5]:
+        o = v0.get(b, 0)
+        if o < 50 or v < o * 1.4:
+            continue
+        d_now, d_then = abs(b - cur), abs(b - then["px"])
+        if d_now > d_then * 1.3:
+            out.append("**멀어지는데 쌓인다** $%s~%s 는 가격에서 멀어졌는데도 "
+                       "%s → %s BTC 로 늘었다."
+                       % (format(b, ","), format(b + BIN, ","),
+                          format(o, ",.0f"), format(v, ",.0f")))
+            break
+
+    # ⑥ 한 시간 만에 현재가 주변 총량이 크게 변했나
+    tn, tp = sum(vn.values()), sum(vp.values())
+    if tp > 200 and abs(tn - tp) / tp >= 0.35:
+        out.append("**한 시간 급변** 현재가 ±6%% 안 총량이 %s → %s BTC (%+.0f%%)."
+                   % (format(tp, ",.0f"), format(tn, ",.0f"),
+                      (tn - tp) / tp * 100))
+
+    return out[:4]
+
+
 def summary(snaps, cur, extra=None):
     s = snaps[-1]
     lb, sb = collections.Counter(), collections.Counter()
@@ -482,7 +625,11 @@ def main():
     K = candles(snaps[0]["ts"].timestamp(),
                 datetime.now(timezone.utc).timestamp())
     cur = draw(snaps, K, a.out, a.days)
-    text = summary(snaps, cur, narrate(snaps, K, cur))
+    body = narrate(snaps, K, cur)
+    al = alerts(snaps, K, cur)
+    if al:
+        body = ["", "**눈에 띄는 것**"] + ["· " + a for a in al] + body
+    text = summary(snaps, cur, body)
     print(text)
     print("-> %s" % a.out)
 
