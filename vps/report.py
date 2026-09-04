@@ -270,7 +270,12 @@ def approach(K, lo, hi, since, above):
 
 
 def fate(path_then, path_now, lo, hi):
-    """그때 그 칸에 있던 계정들이 지금 어떻게 됐나."""
+    """그때 그 칸에 있던 계정들이 지금 어떻게 됐나.
+
+    stay_now 는 남아 있는 계정의 '지금' 물량이다. 현재 칸 물량에서 이걸 빼면
+    그 뒤에 새로 들어온 양이 나온다 — 물량이 늘었을 때 갈아탄 건지
+    원래 있던 게 버틴 건지 갈린다.
+    """
     A, B = load_full(path_then), load_full(path_now)
     coh = {a: v for a, v in A.items()
            if v["liq"] is not None and lo <= v["liq"] < hi}
@@ -278,13 +283,14 @@ def fate(path_then, path_now, lo, hi):
         return None
     r = {"n": len(coh), "btc": sum(abs(v["sz"]) for v in coh.values()),
          "gone": [0, 0.0], "moved": [0, 0.0], "stay": [0, 0.0],
-         "grew": 0, "cut": 0}
+         "grew": 0, "cut": 0, "stay_now": 0.0}
     for a, v in coh.items():
         n = B.get(a)
         if n is None or n["sz"] == 0:
             k = "gone"
         elif n["liq"] is not None and lo <= n["liq"] < hi:
             k = "stay"
+            r["stay_now"] += abs(n["sz"])
         else:
             k = "moved"
             if abs(n["sz"]) > abs(v["sz"]) * 1.05:
@@ -329,42 +335,58 @@ def narrate(snaps, K, cur, hours=24):
         i0 = ser.index(next(x for x in ser if x[0] == then["ts"]))
         v0, vN = ser[i0][2], ser[-1][2]
         peak = max(ser[i0:], key=lambda x: x[2])
-        side = "↑" if b > cur else "↓"
+        above = b > cur
         chg = (vN - v0) / v0 * 100 if v0 else 0.0
+        side = "위" if above else "아래"
 
         out.append("")
-        out.append("■ %s  %s $%s~%s  (%+.1f%%)"
-                   % (tag, side, format(lo, ","), format(hi, ","),
-                      (b - cur) / cur * 100))
-        out.append("   %dh 전 %s → 최대 %s → 지금 %s BTC  (%+.0f%%)"
-                   % (hours, format(v0, ",.0f"), format(peak[2], ",.0f"),
-                      format(vN, ",.0f"), chg))
+        out.append("**%s — $%s~%s** (현재가 %+.1f%%, %s쪽 %s 청산)"
+                   % (tag, format(lo, ","), format(hi, ","),
+                      (b - cur) / cur * 100, side,
+                      "숏" if above else "롱"))
 
-        near, hit = approach(K, lo, hi, then["ts"].timestamp(), b > cur)
+        p1 = ("하루 전 %s BTC 였던 것이 한때 %s 까지 불었다가 지금 %s BTC 다. "
+              % (format(v0, ",.0f"), format(peak[2], ",.0f"), format(vN, ",.0f")))
+        p1 += ("하루 전보다 %.0f%% 많다. " % chg if chg > 0
+               else "하루 전보다 %.0f%% 줄었다. " % -chg)
+        near, hit = approach(K, lo, hi, then["ts"].timestamp(), above)
         if near is not None:
-            out.append("   그 뒤 가격이 간 곳 $%s%s"
-                       % (format(near, ",.0f"),
-                          "  ← 칸 안까지 들어옴" if hit else "  (칸에 못 닿음)"))
+            p1 += ("그 사이 가격은 $%s 까지 %s이 구간 안으로 들어왔다."
+                   % (format(near, ",.0f"), "올라 " if above else "내려 ")) if hit else                   ("그 사이 가격은 $%s 까지밖에 못 %s 이 구간에는 닿지 않았다."
+                   % (format(near, ",.0f"), "올라갔고" if above else "내려갔고"))
+        out.append(p1)
 
         f = fate(then["path"], snaps[-1]["path"], lo, hi)
         if f:
-            out.append("   그때 %d개 계정 → 종료 %d(%s BTC) / 청산가이동 %d(%s BTC) / 잔류 %d"
-                       % (f["n"], f["gone"][0], format(f["gone"][1], ",.0f"),
-                          f["moved"][0], format(f["moved"][1], ",.0f"),
-                          f["stay"][0]))
+            out.append(
+                "하루 전 여기 있던 %d개 계정을 따라가면, %d개(%s BTC)는 포지션을 아예 닫았고 "
+                "%d개(%s BTC)는 살아남았지만 청산가가 구간 밖으로 옮겨갔다. %d개만 그대로다."
+                % (f["n"], f["gone"][0], format(f["gone"][1], ",.0f"),
+                   f["moved"][0], format(f["moved"][1], ",.0f"), f["stay"][0]))
             if f["moved"][0]:
-                out.append("     이동한 것 중 사이즈 늘림 %d / 줄임 %d"
-                           % (f["grew"], f["cut"]))
+                out.append("옮긴 %d개 중 %d개는 사이즈를 늘렸고 %d개는 줄였다."
+                           % (f["moved"][0], f["grew"], f["cut"]))
+            fresh = max(vN - f["stay_now"], 0.0)
+            if vN > 0:
+                out.append("지금 쌓인 %s BTC 중 %s BTC 는 그 뒤에 새로 들어온 것이다."
+                           % (format(vN, ",.0f"), format(fresh, ",.0f")))
 
-        # 판정은 사실만. 예측하지 않는다.
-        if chg <= -25 and not hit:
-            out.append("   ⇒ 가격이 그 칸에 닿지 않았는데 줄었다. 청산이 아니라 스스로 뺀 것.")
-        elif chg <= -25 and hit:
-            out.append("   ⇒ 가격이 칸에 닿았고 줄었다. 청산과 이탈이 섞여 있다 — 위 계정 내역을 볼 것.")
-        elif chg >= 25:
-            out.append("   ⇒ 물량이 늘었다. 이 자리에 새로 실렸다.")
-        else:
-            out.append("   ⇒ 큰 변화 없음.")
+            # 판정은 사실만. 예측하지 않는다.
+            turnover = f["stay"][0] / f["n"] if f["n"] else 1.0
+            if chg >= 25 and turnover < 0.3:
+                out.append("→ 원래 있던 %s은 거의 다 빠졌는데 더 많은 물량이 새로 실렸다. "
+                           "같은 자리지만 사람이 바뀐 셈이다."
+                           % ("숏" if above else "롱"))
+            elif chg >= 25:
+                out.append("→ 이 자리에 물량이 더 쌓였다.")
+            elif chg <= -25 and not hit:
+                out.append("→ 가격이 이 구간에 닿지도 않았는데 물량이 줄었다. "
+                           "청산된 게 아니라 스스로 뺀 것이다.")
+            elif chg <= -25:
+                out.append("→ 가격이 구간에 닿았고 물량도 줄었다. "
+                           "청산과 자발적 이탈이 섞여 있어 위 계정 내역으로 갈라야 한다.")
+            else:
+                out.append("→ 총량은 크게 안 변했다. 다만 위 내역대로 안에서는 손바뀜이 있었다.")
     return out
 
 
@@ -407,8 +429,8 @@ def summary(snaps, cur, extra=None):
     out.append("포지션         롱 %s개 %s BTC   숏 %s개 %s BTC"
                % (format(len(L), ","), format(sum(p[0] for p in L), ",.0f"),
                   format(len(S), ","), format(sum(-p[0] for p in S), ",.0f")))
-    out += (extra or [])
     out.append("```")
+    out += (extra or [])
     return "\n".join(out)
 
 
