@@ -340,19 +340,22 @@ def narrate(snaps, K, cur, hours=24):
         side = "위" if above else "아래"
 
         out.append("")
-        out.append("**%s — $%s~%s** (현재가 %+.1f%%, %s쪽 %s 청산)"
+        out.append("**%s — $%s~%s**  (현재가 %+.1f%%)"
                    % (tag, format(lo, ","), format(hi, ","),
-                      (b - cur) / cur * 100, side,
-                      "숏" if above else "롱"))
+                      (b - cur) / cur * 100))
+        out.append(
+            "여기서 청산될 %s이 %s BTC ($%sM) 걸려 있다. 터지면 강제 %s가 나온다."
+            % ("숏" if above else "롱", format(vN, ",.0f"),
+               format(vN * cur / 1e6, ",.0f"), "매수" if above else "매도"))
 
-        p1 = ("하루 전 %s BTC 였던 것이 한때 %s 까지 불었다가 지금 %s BTC 다. "
-              % (format(v0, ",.0f"), format(peak[2], ",.0f"), format(vN, ",.0f")))
-        p1 += ("하루 전보다 %.0f%% 많다. " % chg if chg > 0
-               else "하루 전보다 %.0f%% 줄었다. " % -chg)
+        p1 = ("하루 전에는 %s BTC 였으니 %.0f%% %s. "
+              % (format(v0, ",.0f"), abs(chg), "늘었다" if chg > 0 else "줄었다"))
+        if peak[2] > max(v0, vN) * 1.1:
+            p1 += "그 사이 한때 %s 까지 불기도 했다. " % format(peak[2], ",.0f")
         near, hit = approach(K, lo, hi, then["ts"].timestamp(), above)
         if near is not None:
-            p1 += ("그 사이 가격은 $%s 까지 %s이 구간 안으로 들어왔다."
-                   % (format(near, ",.0f"), "올라 " if above else "내려 ")) if hit else                   ("그 사이 가격은 $%s 까지밖에 못 %s 이 구간에는 닿지 않았다."
+            p1 += ("가격은 $%s 까지 %s 이 구간 안으로 들어왔다."
+                   % (format(near, ",.0f"), "올라" if above else "내려")) if hit else                   ("가격은 $%s 까지밖에 못 %s 이 구간에는 닿지 않았다."
                    % (format(near, ",.0f"), "올라갔고" if above else "내려갔고"))
         out.append(p1)
 
@@ -387,6 +390,11 @@ def narrate(snaps, K, cur, hours=24):
                            "청산과 자발적 이탈이 섞여 있어 위 계정 내역으로 갈라야 한다.")
             else:
                 out.append("→ 총량은 크게 안 변했다. 다만 위 내역대로 안에서는 손바뀜이 있었다.")
+    if out:
+        out.append("")
+        out.append("-# 청산가는 하이퍼리퀴드가 계산한 값이다. cross 계정은 그 포지션이 아니라 "
+                   "계좌 전체 담보 기준이라 \"여기서 이 계좌가 무너진다\"에 가깝다. "
+                   "가격이 도착하기 전에 스스로 빠지는 물량이 많으니 예약된 체결로 읽으면 안 된다.")
     return out
 
 
@@ -415,10 +423,10 @@ def summary(snaps, cur, extra=None):
     out = ["**BTC $%s**  (%+.2f%% / 1h)   ·   %s UTC"
            % (format(cur, ",.0f"), chg, s["ts"].strftime("%m-%d %H:%M")),
            "```",
-           "±2%% 안    위(숏청산) %6s BTC    아래(롱청산) %6s BTC"
+           "±2%% 안   위 숏청산 %6s BTC (터지면 매수)   아래 롱청산 %6s BTC (매도)"
            % (format(up2, ",.0f"), format(dn2, ",.0f"))]
     if topu:
-        out.append("±5% 안 가장 큰 자리")
+        out.append("±5% 안 가장 큰 자리 (청산될 물량)")
         out.append("   ↑ $%-9s %6s BTC  %+.1f%%"
                    % (format(topu[0], ","), format(topu[1], ",.0f"),
                       (topu[0] - cur) / cur * 100))
