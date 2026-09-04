@@ -65,6 +65,11 @@ def signature(fig, handle="@kyokyokyooo", color="#5c6473", knock=BG,
 
 
 def load_snapshots(days):
+    """가벼운 형태로 읽는다 — 주소는 버린다.
+
+    7일치를 주소까지 들고 있으면 40만 건이 넘어 955MB 짜리 서버에서 위험하다.
+    주소가 필요한 계정 추적은 필요한 스냅샷만 load_full 로 다시 읽는다.
+    """
     cut = datetime.now(timezone.utc).timestamp() - days * 86400
     out = []
     for p in sorted(glob.glob(os.path.join(DATA, "*", "*.csv.gz"))):
@@ -76,8 +81,20 @@ def load_snapshots(days):
         pos = [(float(r[1]), float(r[3]) if r[3] else None)
                for r in rows[2:] if r]
         out.append({"ts": ts, "px": float(rows[0][3]), "pos": pos,
-                    "scanned": int(rows[0][7])})
+                    "scanned": int(rows[0][7]), "path": p})
     return out
+
+
+def load_full(path):
+    """주소를 키로 한 딕셔너리. 계정 단위 추적용."""
+    with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    d = {}
+    for r in rows[2:]:
+        if not r:
+            continue
+        d[r[0]] = {"sz": float(r[1]), "liq": float(r[3]) if r[3] else None}
+    return d
 
 
 def candles(t0, t1):
@@ -221,7 +238,137 @@ def draw(snaps, K, path, days):
     return cur
 
 
-def summary(snaps, cur):
+def zone_series(snaps, lo, hi):
+    """그 가격 칸에 청산가가 걸린 물량과 계정 수를 시간순으로."""
+    out = []
+    for s in snaps:
+        v = n = 0
+        for sz, liq in s["pos"]:
+            if liq is not None and lo <= liq < hi:
+                v += abs(sz)
+                n += 1
+        out.append((s["ts"], s["px"], v, n))
+    return out
+
+
+def approach(K, lo, hi, since, above):
+    """since 이후 가격이 그 칸 쪽으로 얼마나 갔나. (도달 극단값, 칸에 들어왔는지)
+
+    칸이 현재가 위면 고가의 최대치, 아래면 저가의 최소치가 관심사다.
+    칸 안에 들어온 봉의 반대쪽 끝을 집으면 안 된다.
+    """
+    ext = None
+    for t, h, l in zip(K["t"], K["h"], K["l"]):
+        if t / 1000 < since:
+            continue
+        v = h if above else l
+        if ext is None or (v > ext if above else v < ext):
+            ext = v
+    if ext is None:
+        return None, False
+    return ext, lo <= ext < hi
+
+
+def fate(path_then, path_now, lo, hi):
+    """그때 그 칸에 있던 계정들이 지금 어떻게 됐나."""
+    A, B = load_full(path_then), load_full(path_now)
+    coh = {a: v for a, v in A.items()
+           if v["liq"] is not None and lo <= v["liq"] < hi}
+    if not coh:
+        return None
+    r = {"n": len(coh), "btc": sum(abs(v["sz"]) for v in coh.values()),
+         "gone": [0, 0.0], "moved": [0, 0.0], "stay": [0, 0.0],
+         "grew": 0, "cut": 0}
+    for a, v in coh.items():
+        n = B.get(a)
+        if n is None or n["sz"] == 0:
+            k = "gone"
+        elif n["liq"] is not None and lo <= n["liq"] < hi:
+            k = "stay"
+        else:
+            k = "moved"
+            if abs(n["sz"]) > abs(v["sz"]) * 1.05:
+                r["grew"] += 1
+            elif abs(n["sz"]) < abs(v["sz"]) * 0.95:
+                r["cut"] += 1
+        r[k][0] += 1
+        r[k][1] += abs(v["sz"])
+    return r
+
+
+def narrate(snaps, K, cur, hours=24):
+    """가장 큰 자리가 그동안 어떻게 변했는지, 줄었다면 청산인지 이탈인지."""
+    if len(snaps) < 3:
+        return []
+
+    then = min(snaps, key=lambda s: abs(
+        (snaps[-1]["ts"] - s["ts"]).total_seconds() - hours * 3600))
+    if then is snaps[-1]:
+        then = snaps[0]
+
+    # 지금 큰 자리와, 그때 컸던 자리. 다르면 둘 다 본다.
+    cands = []
+    for src, tag in ((snaps[-1], "지금 가장 큰 자리"), (then, "%dh 전 컸던 자리" % hours)):
+        c = collections.Counter()
+        for sz, liq in src["pos"]:
+            if liq is None or abs(liq - cur) / cur > 0.06:
+                continue
+            c[int(liq // BIN) * BIN] += abs(sz)
+        if c:
+            cands.append((max(c, key=c.get), tag))
+    zones = []
+    for b, tag in cands:
+        if all(abs(b - z) > 2 * BIN for z, _ in zones):   # 겹치면 같은 군집이다
+            zones.append((b, tag))
+
+    out = []
+    for b, tag in zones[:2]:
+        # 실제 군집은 $250 한 칸보다 넓게 퍼져 있다. 봉우리 칸 좌우를 묶는다.
+        lo, hi = b - BIN, b + 2 * BIN
+        ser = zone_series(snaps, lo, hi)
+        i0 = ser.index(next(x for x in ser if x[0] == then["ts"]))
+        v0, vN = ser[i0][2], ser[-1][2]
+        peak = max(ser[i0:], key=lambda x: x[2])
+        side = "↑" if b > cur else "↓"
+        chg = (vN - v0) / v0 * 100 if v0 else 0.0
+
+        out.append("")
+        out.append("■ %s  %s $%s~%s  (%+.1f%%)"
+                   % (tag, side, format(lo, ","), format(hi, ","),
+                      (b - cur) / cur * 100))
+        out.append("   %dh 전 %s → 최대 %s → 지금 %s BTC  (%+.0f%%)"
+                   % (hours, format(v0, ",.0f"), format(peak[2], ",.0f"),
+                      format(vN, ",.0f"), chg))
+
+        near, hit = approach(K, lo, hi, then["ts"].timestamp(), b > cur)
+        if near is not None:
+            out.append("   그 뒤 가격이 간 곳 $%s%s"
+                       % (format(near, ",.0f"),
+                          "  ← 칸 안까지 들어옴" if hit else "  (칸에 못 닿음)"))
+
+        f = fate(then["path"], snaps[-1]["path"], lo, hi)
+        if f:
+            out.append("   그때 %d개 계정 → 종료 %d(%s BTC) / 청산가이동 %d(%s BTC) / 잔류 %d"
+                       % (f["n"], f["gone"][0], format(f["gone"][1], ",.0f"),
+                          f["moved"][0], format(f["moved"][1], ",.0f"),
+                          f["stay"][0]))
+            if f["moved"][0]:
+                out.append("     이동한 것 중 사이즈 늘림 %d / 줄임 %d"
+                           % (f["grew"], f["cut"]))
+
+        # 판정은 사실만. 예측하지 않는다.
+        if chg <= -25 and not hit:
+            out.append("   ⇒ 가격이 그 칸에 닿지 않았는데 줄었다. 청산이 아니라 스스로 뺀 것.")
+        elif chg <= -25 and hit:
+            out.append("   ⇒ 가격이 칸에 닿았고 줄었다. 청산과 이탈이 섞여 있다 — 위 계정 내역을 볼 것.")
+        elif chg >= 25:
+            out.append("   ⇒ 물량이 늘었다. 이 자리에 새로 실렸다.")
+        else:
+            out.append("   ⇒ 큰 변화 없음.")
+    return out
+
+
+def summary(snaps, cur, extra=None):
     s = snaps[-1]
     lb, sb = collections.Counter(), collections.Counter()
     for sz, liq in s["pos"]:
@@ -260,6 +407,7 @@ def summary(snaps, cur):
     out.append("포지션         롱 %s개 %s BTC   숏 %s개 %s BTC"
                % (format(len(L), ","), format(sum(p[0] for p in L), ",.0f"),
                   format(len(S), ","), format(sum(-p[0] for p in S), ",.0f")))
+    out += (extra or [])
     out.append("```")
     return "\n".join(out)
 
@@ -304,7 +452,7 @@ def main():
     K = candles(snaps[0]["ts"].timestamp(),
                 datetime.now(timezone.utc).timestamp())
     cur = draw(snaps, K, a.out, a.days)
-    text = summary(snaps, cur)
+    text = summary(snaps, cur, narrate(snaps, K, cur))
     print(text)
     print("-> %s" % a.out)
 
