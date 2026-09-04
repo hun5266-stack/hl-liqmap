@@ -1,12 +1,12 @@
 {
-  "ts": "2026-09-04T15:17:22.979614+00:00",
-  "price": 78881.0,
+  "ts": "2026-09-04T16:17:01.360030+00:00",
+  "price": 79383.0,
   "mode": "full",
-  "scanned": 44884,
-  "btc_positions": 2225,
-  "long_btc": 12221.22,
-  "short_btc": 12695.31,
-  "long_n": 1349,
-  "short_n": 876,
-  "elapsed_s": 1039
+  "scanned": 44865,
+  "btc_positions": 2215,
+  "long_btc": 12994.05,
+  "short_btc": 13363.72,
+  "long_n": 1356,
+  "short_n": 859,
+  "elapsed_s": 1018
 }
