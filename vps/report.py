@@ -311,6 +311,44 @@ def fate(path_then, path_now, lo, hi):
     return r
 
 
+def josa(n, pair=("으로", "로")):
+    """숫자 뒤 조사. 끝자리를 읽은 소리의 받침으로 갈린다.
+
+    삼(ㅁ)·육(ㄱ)·영(ㅇ) 은 '으로', 일·칠·팔 은 ㄹ 받침이라 '로',
+    이·사·오·구 는 받침이 없어 '로'.
+    """
+    return pair[0] if int(n) % 10 in (0, 3, 6) else pair[1]
+
+
+def origin(path_then, path_now, lo, hi):
+    """지금 이 칸에 있는 물량이 어디서 왔나. 셋은 성격이 전혀 다르다.
+
+      held      하루 전에도 이 칸에 있었다 — 그대로 버틴 것
+      moved_in  하루 전에도 포지션은 있었는데 청산가가 다른 칸이었다
+                — 새 돈이 아니다. 가격이 밀려오면서 청산가가 따라 들어온 것
+      new       하루 전에는 포지션 자체가 없었다 — 진짜 신규
+
+    이걸 안 가르면 셋이 전부 '새로 들어온 물량' 으로 뭉뚱그려진다.
+    실제로 $72,000 칸의 601 BTC 는 새 돈이 아니라 기존 롱의 청산가가
+    가격 쪽으로 올라온 것이었다.
+    """
+    A, B = load_full(path_then), load_full(path_now)
+    r = {"held": [0, 0.0], "moved_in": [0, 0.0], "new": [0, 0.0]}
+    for a, x in B.items():
+        if x["liq"] is None or not (lo <= x["liq"] < hi):
+            continue
+        p = A.get(a)
+        if p is None or p["sz"] == 0:
+            k = "new"
+        elif p["liq"] is not None and lo <= p["liq"] < hi:
+            k = "held"
+        else:
+            k = "moved_in"
+        r[k][0] += 1
+        r[k][1] += abs(x["sz"])
+    return r
+
+
 def narrate(snaps, K, cur, hours=24):
     """가장 큰 자리가 그동안 어떻게 변했는지, 줄었다면 청산인지 이탈인지."""
     if len(snaps) < 3:
@@ -387,16 +425,7 @@ def narrate(snaps, K, cur, hours=24):
         # 한 문장: 하루 사이 어떻게 변했고, 가격이 실제로 닿았나.
         cl = ["하루 전 %s BTC에서 %.0f%% %s"
               % (format(v0, ",.0f"), abs(chg), "불었" if chg > 0 else "줄었")]
-        if f and vN > 0:
-            fresh = max(vN - f["stay_now"], 0.0)
-            if fresh / vN >= 0.3:      # 새 물량이 적으면 굳이 안 적는다
-                cl[-1] += "는데"
-                cl.append("그중 %s BTC가 새로 들어온 것이고"
-                          % format(fresh, ",.0f"))
-            else:
-                cl[-1] += "고"
-        else:
-            cl[-1] += "고"
+        cl[-1] += "고"
         if near is not None:
             cl.append("가격은 $%s까지%s"
                       % (format(near, ",.0f"),
@@ -405,6 +434,29 @@ def narrate(snaps, K, cur, hours=24):
                          ("밖에 못 올라가 이 구간에는 닿지 않았다" if above
                           else "밖에 못 내려가 이 구간에는 닿지 않았다")))
         out.append(" ".join(cl).rstrip(" 고는데") + ".")
+
+        # 지금 물량의 출처. 셋을 안 가르면 전부 "새로 들어온 것" 으로 뭉개진다.
+        o = origin(then["path"], snaps[-1]["path"], lo, hi)
+        if vN > 0 and chg > 10:
+            piece = []
+            for k, lab in (("held", "그대로 버틴"), ("moved_in", "청산가가 옮겨 들어온"),
+                           ("new", "새로 잡힌")):
+                if o[k][1] / vN >= 0.08:
+                    piece.append("%s %s" % (lab, format(o[k][1], ",.0f")))
+            if len(piece) >= 2:
+                last = piece[-1].split()[-1].replace(",", "")
+                out.append("지금 %s BTC는 %s%s 나뉜다."
+                           % (format(vN, ",.0f"), ", ".join(piece), josa(last)))
+            # 총량 대비가 아니라 둘을 맞대야 한다. 늘어난 몫이 어디서 왔는지가 질문이다.
+            mi, nw = o["moved_in"][1], o["new"][1]
+            if mi > nw * 2 and mi / vN >= 0.25:
+                out.append("새로 잡힌 것은 거의 없다 — 원래 있던 %s의 청산가가 "
+                           "가격 쪽으로 %s 것이다."
+                           % ("숏" if above else "롱",
+                              "밀려 내려온" if above else "밀려 올라온"))
+            elif nw > mi * 1.5 and nw / vN >= 0.25:
+                out.append("상당 부분이 새로 잡힌 %s이다."
+                           % ("숏" if above else "롱"))
 
         # 마지막 문장은 갈리는 대목일 때만. 뻔하면 안 쓴다.
         if f:
@@ -415,8 +467,9 @@ def narrate(snaps, K, cur, hours=24):
                 out.append("가격이 닿은 뒤 줄었는데, 하루 전 %d개 중 %d개는 포지션을 닫았고 "
                            "%d개는 청산가만 옮겼다 — 청산과 이탈이 섞여 있다."
                            % (f["n"], f["gone"][0], f["moved"][0]))
-            elif chg >= 25 and turn < 0.3:
-                out.append("원래 있던 %d개 중 %d개만 남았으니 자리는 같아도 사람이 통째로 바뀌었다."
+            elif chg >= 25 and turn < 0.3 and o["new"][1] / max(vN, 1) >= 0.4:
+                out.append("원래 있던 %d개 중 %d개만 남고 대부분이 새로 잡힌 포지션이니, "
+                           "자리는 같아도 사람이 통째로 바뀌었다."
                            % (f["n"], f["stay"][0]))
     if out:
         out.append("")
