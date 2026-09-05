@@ -571,47 +571,14 @@ def alerts(snaps, K, cur, hours=24):
 
 
 def summary(snaps, cur, extra=None):
+    """머리말 한 줄과 본문. 숫자 표는 빼고 서술만 남긴다 —
+    같은 값이 아래 서술에 문장으로 다시 나오고, 표는 잘 안 읽힌다."""
     s = snaps[-1]
-    lb, sb = collections.Counter(), collections.Counter()
-    for sz, liq in s["pos"]:
-        if liq is None or abs(liq - cur) / cur > 0.12:
-            continue
-        (lb if sz > 0 else sb)[int(liq // BIN) * BIN] += abs(sz)
-
-    up2 = sum(v for b, v in sb.items() if cur < b <= cur * 1.02)
-    dn2 = sum(v for b, v in lb.items() if cur * 0.98 <= b < cur)
-    # 멀리 있는 큰 자리보다 가까운 쪽이 쓸모 있다. ±5% 안에서 고른다.
-    NEAR = 0.05
-    ups = [(b, v) for b, v in sb.items() if cur < b <= cur * (1 + NEAR)]
-    dns = [(b, v) for b, v in lb.items() if cur * (1 - NEAR) <= b < cur]
-    topu = max(ups, key=lambda x: x[1], default=None)
-    topd = max(dns, key=lambda x: x[1], default=None)
-
     prev = snaps[-2]["px"] if len(snaps) > 1 else cur
     chg = (cur - prev) / prev * 100
-    L = [p for p in s["pos"] if p[0] > 0]
-    S = [p for p in s["pos"] if p[0] < 0]
-
-    out = ["**BTC $%s**  (%+.2f%% / 1h)   ·   %s KST"
-           % (format(cur, ",.0f"), chg, kst(s["ts"]).strftime("%m-%d %H:%M")),
-           "```",
-           "±2%% 안   위 숏청산 %6s BTC (터지면 매수)   아래 롱청산 %6s BTC (매도)"
-           % (format(up2, ",.0f"), format(dn2, ",.0f"))]
-    if topu:
-        out.append("±5% 안 가장 큰 자리 (청산될 물량)")
-        out.append("   ↑ $%-9s %6s BTC  %+.1f%%"
-                   % (format(topu[0], ","), format(topu[1], ",.0f"),
-                      (topu[0] - cur) / cur * 100))
-    if topd:
-        out.append("   ↓ $%-9s %6s BTC  %+.1f%%"
-                   % (format(topd[0], ","), format(topd[1], ",.0f"),
-                      (topd[0] - cur) / cur * 100))
-    out.append("포지션         롱 %s개 %s BTC   숏 %s개 %s BTC"
-               % (format(len(L), ","), format(sum(p[0] for p in L), ",.0f"),
-                  format(len(S), ","), format(sum(-p[0] for p in S), ",.0f")))
-    out.append("```")
-    out += (extra or [])
-    return "\n".join(out)
+    head = ("**BTC $%s**  (%+.2f%% / 1h)   ·   %s KST"
+            % (format(cur, ",.0f"), chg, kst(s["ts"]).strftime("%m-%d %H:%M")))
+    return "\n".join([head] + (extra or []))
 
 
 def post(url, text, png):
