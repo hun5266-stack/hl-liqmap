@@ -355,70 +355,69 @@ def narrate(snaps, K, cur, hours=24):
         ser = zone_series(snaps, lo, hi)
         i0 = ser.index(next(x for x in ser if x[0] == then["ts"]))
         v0, vN = ser[i0][2], ser[-1][2]
-        peak = max(ser[i0:], key=lambda x: x[2])
         above = b > cur
         chg = (vN - v0) / v0 * 100 if v0 else 0.0
-        side = "위" if above else "아래"
+        near, hit = approach(K, lo, hi, then["ts"].timestamp(), above)
+        f = fate(then["path"], snaps[-1]["path"], lo, hi)
+        mem = sorted((abs(x["sz"]) for x in NOW.values()
+                      if x["liq"] is not None and lo <= x["liq"] < hi), reverse=True)
 
         out.append("")
         out.append("**%s — $%s~%s**  (현재가 %+.1f%%)"
                    % (tag, format(lo, ","), format(hi, ","),
                       (b - cur) / cur * 100))
-        out.append(
-            "여기서 청산될 %s이 %s BTC ($%sM) 걸려 있다. 터지면 강제 %s가 나온다."
-            % ("숏" if above else "롱", format(vN, ",.0f"),
-               format(vN * cur / 1e6, ",.0f"), "매수" if above else "매도"))
 
-        mem = sorted((abs(x["sz"]) for x in NOW.values()
-                       if x["liq"] is not None and lo <= x["liq"] < hi), reverse=True)
+        # 한 문장: 무엇이 얼마나 걸려 있고, 몇 명이 나눠 갖고 있나.
+        s1 = ("터지면 강제 %s가 나올 %s %s BTC($%sM)가 걸려 있"
+              % ("매수" if above else "매도", "숏" if above else "롱",
+                 format(vN, ",.0f"), format(vN * cur / 1e6, ",.0f")))
         if mem:
-            out.append("계정 %d개가 나눠 갖고 있고 가장 큰 하나가 %s BTC (%.0f%%) 다.%s"
-                       % (len(mem), format(mem[0], ",.0f"), mem[0] / sum(mem) * 100,
-                          "  한 명이 빠지면 절반이 사라진다."
-                          if mem[0] / sum(mem) >= 0.5 else ""))
-
-        p1 = ("하루 전에는 %s BTC 였으니 %.0f%% %s. "
-              % (format(v0, ",.0f"), abs(chg), "늘었다" if chg > 0 else "줄었다"))
-        if peak[2] > max(v0, vN) * 1.1:
-            p1 += "그 사이 한때 %s 까지 불기도 했다. " % format(peak[2], ",.0f")
-        near, hit = approach(K, lo, hi, then["ts"].timestamp(), above)
-        if near is not None:
-            p1 += ("가격은 $%s 까지 %s 이 구간 안으로 들어왔다."
-                   % (format(near, ",.0f"), "올라" if above else "내려")) if hit else                   ("가격은 $%s 까지밖에 못 %s 이 구간에는 닿지 않았다."
-                   % (format(near, ",.0f"), "올라갔고" if above else "내려갔고"))
-        out.append(p1)
-
-        f = fate(then["path"], snaps[-1]["path"], lo, hi)
-        if f:
-            out.append(
-                "하루 전 여기 있던 %d개 계정을 따라가면, %d개(%s BTC)는 포지션을 아예 닫았고 "
-                "%d개(%s BTC)는 살아남았지만 청산가가 구간 밖으로 옮겨갔다. %d개만 그대로다."
-                % (f["n"], f["gone"][0], format(f["gone"][1], ",.0f"),
-                   f["moved"][0], format(f["moved"][1], ",.0f"), f["stay"][0]))
-            if f["moved"][0]:
-                out.append("옮긴 %d개 중 %d개는 사이즈를 늘렸고 %d개는 줄였다."
-                           % (f["moved"][0], f["grew"], f["cut"]))
-            fresh = max(vN - f["stay_now"], 0.0)
-            if vN > 0:
-                out.append("지금 쌓인 %s BTC 중 %s BTC 는 그 뒤에 새로 들어온 것이다."
-                           % (format(vN, ",.0f"), format(fresh, ",.0f")))
-
-            # 판정은 사실만. 예측하지 않는다.
-            turnover = f["stay"][0] / f["n"] if f["n"] else 1.0
-            if chg >= 25 and turnover < 0.3:
-                out.append("→ 원래 있던 %s은 거의 다 빠졌는데 더 많은 물량이 새로 실렸다. "
-                           "같은 자리지만 사람이 바뀐 셈이다."
-                           % ("숏" if above else "롱"))
-            elif chg >= 25:
-                out.append("→ 이 자리에 물량이 더 쌓였다.")
-            elif chg <= -25 and not hit:
-                out.append("→ 가격이 이 구간에 닿지도 않았는데 물량이 줄었다. "
-                           "청산된 게 아니라 스스로 뺀 것이다.")
-            elif chg <= -25:
-                out.append("→ 가격이 구간에 닿았고 물량도 줄었다. "
-                           "청산과 자발적 이탈이 섞여 있어 위 계정 내역으로 갈라야 한다.")
+            share = mem[0] / sum(mem)
+            if share >= 0.5:
+                s1 += ("고, %d개 계정 중 하나가 %s BTC로 %.0f%%를 차지한다 — "
+                       "그 한 명이 빠지면 절반이 사라진다."
+                       % (len(mem), format(mem[0], ",.0f"), share * 100))
             else:
-                out.append("→ 총량은 크게 안 변했다. 다만 위 내역대로 안에서는 손바뀜이 있었다.")
+                s1 += ("고, %d개 계정이 나눠 가져 가장 큰 하나도 %.0f%%에 그친다."
+                       % (len(mem), share * 100))
+        else:
+            s1 += "다."
+        out.append(s1)
+
+        # 한 문장: 하루 사이 어떻게 변했고, 가격이 실제로 닿았나.
+        cl = ["하루 전 %s BTC에서 %.0f%% %s"
+              % (format(v0, ",.0f"), abs(chg), "불었" if chg > 0 else "줄었")]
+        if f and vN > 0:
+            fresh = max(vN - f["stay_now"], 0.0)
+            if fresh / vN >= 0.3:      # 새 물량이 적으면 굳이 안 적는다
+                cl[-1] += "는데"
+                cl.append("그중 %s BTC가 새로 들어온 것이고"
+                          % format(fresh, ",.0f"))
+            else:
+                cl[-1] += "고"
+        else:
+            cl[-1] += "고"
+        if near is not None:
+            cl.append("가격은 $%s까지%s"
+                      % (format(near, ",.0f"),
+                         (" 올라 이 구간 안으로 들어왔다" if above
+                          else " 내려 이 구간 안으로 들어왔다") if hit else
+                         ("밖에 못 올라가 이 구간에는 닿지 않았다" if above
+                          else "밖에 못 내려가 이 구간에는 닿지 않았다")))
+        out.append(" ".join(cl).rstrip(" 고는데") + ".")
+
+        # 마지막 문장은 갈리는 대목일 때만. 뻔하면 안 쓴다.
+        if f:
+            turn = f["stay"][0] / f["n"] if f["n"] else 1.0
+            if chg <= -25 and not hit:
+                out.append("가격이 닿지도 않았는데 줄었으니 청산이 아니라 스스로 뺀 것이다.")
+            elif chg <= -25:
+                out.append("가격이 닿은 뒤 줄었는데, 하루 전 %d개 중 %d개는 포지션을 닫았고 "
+                           "%d개는 청산가만 옮겼다 — 청산과 이탈이 섞여 있다."
+                           % (f["n"], f["gone"][0], f["moved"][0]))
+            elif chg >= 25 and turn < 0.3:
+                out.append("원래 있던 %d개 중 %d개만 남았으니 자리는 같아도 사람이 통째로 바뀌었다."
+                           % (f["n"], f["stay"][0]))
     if out:
         out.append("")
         out.append("-# 청산가는 하이퍼리퀴드가 계산한 값이다. cross 계정은 그 포지션이 아니라 "
