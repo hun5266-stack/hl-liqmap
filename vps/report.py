@@ -321,21 +321,33 @@ def narrate(snaps, K, cur, hours=24):
     if then is snaps[-1]:
         then = snaps[0]
 
-    # 지금 큰 자리와, 그때 컸던 자리. 다르면 둘 다 본다.
-    cands = []
-    for src, tag in ((snaps[-1], "지금 가장 큰 자리"), (then, "%dh 전 컸던 자리" % hours)):
+    # 두 가지를 본다. 제일 큰 자리는 멀리 있을 수 있고(현재 -9% 에 1,385 BTC),
+    # 가까운 자리는 작아도 실제로 밟힐 자리다. 하나만 고르면 다른 쪽이 안 보인다.
+    def peak(src, px, span):
         c = collections.Counter()
         for sz, liq in src["pos"]:
-            if liq is None or abs(liq - cur) / cur > 0.06:
+            if liq is None or abs(liq - px) / px > span:
                 continue
             c[int(liq // BIN) * BIN] += abs(sz)
-        if c:
-            cands.append((max(c, key=c.get), tag))
+        if not c:
+            return None
+        # 군집은 한 칸보다 넓다. 3칸 창의 합이 가장 큰 봉우리를 고른다
+        return max(c, key=lambda b: sum(c.get(b + k * BIN, 0) for k in (-1, 0, 1)))
+
+    cands = []
+    big = peak(snaps[-1], cur, 0.15)
+    near = peak(snaps[-1], cur, 0.035)
+    if big is not None:
+        cands.append((big, "가장 큰 자리"))
+    if near is not None:
+        cands.append((near, "가장 가까운 자리"))
+
     zones = []
     for b, tag in cands:
         if all(abs(b - z) > 2 * BIN for z, _ in zones):   # 겹치면 같은 군집이다
             zones.append((b, tag))
 
+    NOW = load_full(snaps[-1]["path"])
     out = []
     for b, tag in zones[:2]:
         # 실제 군집은 $250 한 칸보다 넓게 퍼져 있다. 봉우리 칸 좌우를 묶는다.
@@ -356,6 +368,14 @@ def narrate(snaps, K, cur, hours=24):
             "여기서 청산될 %s이 %s BTC ($%sM) 걸려 있다. 터지면 강제 %s가 나온다."
             % ("숏" if above else "롱", format(vN, ",.0f"),
                format(vN * cur / 1e6, ",.0f"), "매수" if above else "매도"))
+
+        mem = sorted((abs(x["sz"]) for x in NOW.values()
+                       if x["liq"] is not None and lo <= x["liq"] < hi), reverse=True)
+        if mem:
+            out.append("계정 %d개가 나눠 갖고 있고 가장 큰 하나가 %s BTC (%.0f%%) 다.%s"
+                       % (len(mem), format(mem[0], ",.0f"), mem[0] / sum(mem) * 100,
+                          "  한 명이 빠지면 절반이 사라진다."
+                          if mem[0] / sum(mem) >= 0.5 else ""))
 
         p1 = ("하루 전에는 %s BTC 였으니 %.0f%% %s. "
               % (format(v0, ",.0f"), abs(chg), "늘었다" if chg > 0 else "줄었다"))
