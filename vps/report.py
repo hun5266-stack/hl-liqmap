@@ -15,6 +15,11 @@ import os
 import sys
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import market
+from vps import tracking
 
 import matplotlib
 matplotlib.use("Agg")
@@ -31,6 +36,7 @@ WEBHOOK_FILE = os.environ.get("LIQMAP_WEBHOOK") or "/root/.discord_webhook"
 BG = "#0d1015"
 BIN = 250
 DAYS = 7
+SINCE = os.environ.get("LIQMAP_SINCE", "2026-09-03T13:00:00+00:00")
 
 # 윈도우는 맑은 고딕, 우분투는 나눔고딕. 없으면 기본 폰트로 떨어진다.
 for _f in ("Malgun Gothic", "NanumGothic", "Noto Sans CJK KR"):
@@ -73,62 +79,89 @@ def signature(fig, handle="@kyokyokyooo", color="#5c6473", knock=BG,
         edgecolor="none", zorder=11))
 
 
-def load_snapshots(days):
-    """가벼운 형태로 읽는다 — 주소는 버린다.
-
-    7일치를 주소까지 들고 있으면 40만 건이 넘어 955MB 짜리 서버에서 위험하다.
-    주소가 필요한 계정 추적은 필요한 스냅샷만 load_full 로 다시 읽는다.
-    """
-    cut = datetime.now(timezone.utc).timestamp() - days * 86400
+def load_snapshots(days, as_of=None, since=SINCE):
+    end = as_of or datetime.now(timezone.utc)
+    cut = max(end-timedelta(days=days), datetime.fromisoformat(since))
     out = []
-    for p in sorted(glob.glob(os.path.join(DATA, "*", "*.csv.gz"))):
-        with gzip.open(p, "rt", encoding="utf-8", newline="") as f:
-            rows = list(csv.reader(f))
-        ts = datetime.fromisoformat(rows[0][1])
-        if ts.timestamp() < cut:
-            continue
-        pos = [(float(r[1]), float(r[3]) if r[3] else None)
-               for r in rows[2:] if r]
-        out.append({"ts": ts, "px": float(rows[0][3]), "pos": pos,
-                    "scanned": int(rows[0][7]), "path": p})
-    return out
+    for p in sorted(glob.glob(os.path.join(DATA, '*', '*.csv.gz'))):
+        with gzip.open(p,'rt',encoding='utf-8',newline='') as f:
+            reader=csv.reader(f)
+            meta_row=next(reader)
+            meta=dict(zip(meta_row[::2],meta_row[1::2]))
+            ts=datetime.fromisoformat(meta['#ts'])
+            if not cut<=ts<=end or meta.get('mode')!='full' or 'kept' in meta:
+                continue
+            next(reader)
+            pos=[(float(r[1]),float(r[3]) if r[3] else None) for r in reader if r]
+        out.append(dict(ts=ts,px=float(meta['px']),pos=pos,scanned=int(meta['scanned']),
+                        path=p,meta=meta,complete=meta.get('complete')=='true'))
+    return sorted(out,key=lambda x:x['ts'])
 
 
 def load_full(path):
-    """주소를 키로 한 딕셔너리. 계정 단위 추적용."""
-    with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
-        rows = list(csv.reader(f))
-    d = {}
-    for r in rows[2:]:
-        if not r:
-            continue
-        d[r[0]] = {"sz": float(r[1]), "liq": float(r[3]) if r[3] else None}
-    return d
+    return tracking.load_full(path)
 
 
-def candles(t0, t1):
-    """바이낸스 5분봉. 도쿄 VPS 에서는 붙는다 (미국 IP 는 451 로 막힌다)."""
-    out = {"t": [], "h": [], "l": [], "c": []}
-    cur, end = int(t0 * 1000), int(t1 * 1000)
-    while cur < end:
-        u = ("https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT"
-             "&interval=5m&startTime=%d&endTime=%d&limit=1500" % (cur, end))
+def candles(t0,t1,offline=False):
+    rows={}
+    for path in sorted(glob.glob(os.path.join(DATA,'*','*.candles.json.gz'))):
         try:
-            k = json.load(urllib.request.urlopen(
-                urllib.request.Request(u, headers={"User-Agent": "liqmap/1.0"}),
-                timeout=20))
-        except Exception as e:
-            print("  [경고] 봉 조회 실패: %s" % e, file=sys.stderr)
-            break
-        if not k:
-            break
-        for c in k:
-            out["t"].append(c[0])
-            out["h"].append(float(c[2]))
-            out["l"].append(float(c[3]))
-            out["c"].append(float(c[4]))
-        cur = k[-1][0] + 300000
-    return out
+            with gzip.open(path,'rt',encoding='utf-8') as f:
+                for r in json.load(f):
+                    if t0*1000<=r['t'] and r['T']<t1*1000:
+                        rows[r['t']]=r
+        except (OSError,ValueError,KeyError,TypeError) as exc:
+            print(f'[경고] 가격 파일 읽기 실패: {path}: {exc}',file=sys.stderr)
+    if not offline:
+        try:
+            rows.update({r['t']:r for r in market.candle_history(t0,t1)})
+        except Exception as exc:
+            print(f'[경고] 하이퍼리퀴드 캔들 조회 실패: {exc}',file=sys.stderr)
+    ordered=[rows[t] for t in sorted(rows)]
+    return {k:[r[k] for r in ordered] for k in ('t','h','l','c')}
+
+
+def load_marks(t0,t1):
+    rows={}
+    for path in sorted(glob.glob(os.path.join(DATA,'*','*.marks.json.gz'))):
+        try:
+            with gzip.open(path,'rt',encoding='utf-8') as f:
+                for r in json.load(f):
+                    if r.get('source')=='hyperliquid_mark' and t0*1000<=r['t']<=t1*1000:
+                        rows[r['t']]=r['px']
+        except (OSError,ValueError,KeyError,TypeError):
+            continue
+    for r in market.read_marks(t0,t1):
+        rows[r['t']]=r['px']
+    return {'t':sorted(rows),'p':[rows[t] for t in sorted(rows)]}
+
+
+def contact(M,lo,hi,t0,t1):
+    points=[(t/1000,p) for t,p in zip(M.get('t',[]),M.get('p',[])) if t0<=t/1000<=t1]
+    hit=any(lo<=p<hi for _,p in points)
+    cross=any(b[0]-a[0]<=15 and ((a[1]<lo and b[1]>=hi) or (b[1]<lo and a[1]>=hi)) for a,b in zip(points,points[1:]))
+    complete=bool(points) and points[0][0]-t0<=15 and t1-points[-1][0]<=15 and all(b[0]-a[0]<=15 for a,b in zip(points,points[1:]))
+    if cross:
+        return '구간 관통 관측(표본 사이 통과)'
+    if hit:
+        return '구간 내부 마크가격 관측'
+    return '기록된 마크가격에서 미도달' if complete else '마크가격 기록 부족으로 도달 여부 미확인'
+
+
+def forward_grid(snaps,G):
+    # A column starts at completion, never before it. Stop after 90 minutes.
+    times=mdates.date2num([kst(x['ts']) for x in snaps])
+    edges=[times[0]]
+    columns=[]
+    for i,t in enumerate(times):
+        next_t=times[i+1] if i+1<len(times) else t+1/24
+        stop=min(next_t,t+90/1440)
+        columns.append(G[:,i])
+        edges.append(stop)
+        if stop<next_t:
+            columns.append(np.full(G.shape[0],np.nan))
+            edges.append(next_t)
+    return np.array(edges),np.column_stack(columns)
 
 
 def grid(snaps):
@@ -147,10 +180,10 @@ def grid(snaps):
     return np.array(bins, float), G
 
 
-def draw(snaps, K, path, days):
+def draw(snaps, K, path, days, M=None):
     bins, G = grid(snaps)
     ts = [s["ts"] for s in snaps]
-    cur = K["c"][-1] if K["c"] else snaps[-1]["px"]
+    cur = snaps[-1]["px"]
     hi, lo = (max(K["h"]), min(K["l"])) if K["h"] else (cur, cur)
 
     m = (bins >= cur * 0.86) & (bins <= cur * 1.14)
@@ -169,9 +202,23 @@ def draw(snaps, K, path, days):
     cax = fig.add_subplot(gs[2])
 
     tn = mdates.date2num([kst(t) for t in ts])
-    ex = np.concatenate([[tn[0] - 0.02], (tn[:-1] + tn[1:]) / 2, [tn[-1] + 0.02]])
-    ey = np.concatenate([bins - BIN / 2, [bins[-1] + BIN / 2]])
-    pm = ax.pcolormesh(ex, ey, np.clip(G, 0, 420), cmap=cmap, shading="flat")
+    ex, display = forward_grid(snaps, G)
+    ey = np.concatenate([bins, [bins[-1] + BIN]])
+    pm = ax.pcolormesh(ex, ey, np.ma.masked_invalid(np.clip(display, 0, 420)), cmap=cmap, shading="flat")
+    for i,s in enumerate(snaps):
+        if not s.get('complete'):
+            stop=min(tn[i]+90/1440,tn[i+1] if i+1<len(tn) else ex[-1])
+            ax.axvspan(tn[i],stop,facecolor='none',edgecolor='#697080',hatch='..',linewidth=0,alpha=.30)
+    if M and M['t']:
+        mt,mp=[],[]
+        last=None
+        for t,price in zip(M['t'],M['p']):
+            dt=mdates.date2num(kst(datetime.fromtimestamp(t/1000,timezone.utc)))
+            if last is not None and t-last>15000:
+                mt.append(dt); mp.append(np.nan)
+            mt.append(dt); mp.append(price)
+            last=t
+        ax.plot(mt,mp,color='#f4c75e',lw=.9,zorder=8,label='마크가격')
 
     if K["t"]:
         kt = mdates.date2num([kst(datetime.fromtimestamp(t / 1000, timezone.utc))
@@ -192,14 +239,13 @@ def draw(snaps, K, path, days):
              fontsize=17.5, va="top", weight="bold")
     fig.text(0.055, 0.912,
              "청산가 = 수집 스냅샷 %d개 (%s ~ %s KST, 계정 %s개 전수)"
-             "   ·   가격 = 바이낸스 5분봉 %s개"
+             "   ·   가격 = 하이퍼리퀴드 5분봉 %s개"
              % (len(snaps), kst(ts[0]).strftime("%m/%d %H:%M"),
                 kst(ts[-1]).strftime("%m/%d %H:%M"),
                 format(snaps[-1]["scanned"], ","), format(len(K["t"]), ",")),
              color="#8f97a6", fontsize=10.5, va="top")
     fig.text(0.055, 0.882,
-             "흰 띠가 5분봉 고저 범위, 가운데 선이 종가 · "
-             "배경이 밝을수록 그 가격대에 청산가가 몰려 있다",
+             "흰 띠·선 = 거래가격 고저·종가 · 노랑 = 마크가격(미수집 구간은 표시 없음) · 점무늬 = 조회 완전성 미확인",
              color="#6f7889", fontsize=9.8, va="top")
 
     ax.set_facecolor(BG)
@@ -211,16 +257,17 @@ def draw(snaps, K, path, days):
     for s in ax.spines.values():
         s.set_color("#2b323d")
     ax.grid(alpha=0.09, color="white", lw=0.5)
-    ax.set_xlim(tn[0] - 0.02, tn[-1] + 0.02)
+    ax.set_xlim(ex[0], ex[-1])
 
-    bx.barh(bins, G[:, -1], height=BIN * 0.92,
+    bx.barh(bins + BIN / 2, G[:, -1], height=BIN * 0.92,
             color=["#e8443a" if b < cur else "#3aa0e8" for b in bins])
-    bx.axhspan(lo, hi, color="white", alpha=0.09, zorder=0)
+    if K['t']:
+        bx.axhspan(lo, hi, color="white", alpha=0.09, zorder=0)
     bx.axhline(cur, color="white", lw=1.5, ls=(0, (4, 3)))
-    bx.annotate("현재 $%s" % format(cur, ",.0f"), (0.98, cur),
+    bx.annotate("기준 $%s" % format(cur, ",.0f"), (0.98, cur),
                 xycoords=("axes fraction", "data"), color="white",
                 fontsize=10, ha="right", va="bottom")
-    bx.annotate("흐린 띠 = %d일간\n가격이 닿은 범위" % days, (0.97, 0.985),
+    bx.annotate("흐린 띠 = 확보된 거래가격\n캔들의 고저 범위" if K['t'] else "가격 캔들 미확보\n도달 범위 표시 없음", (0.97, 0.985),
                 xycoords="axes fraction", color="#7b8494", fontsize=9,
                 ha="right", va="top")
     bx.set_facecolor(BG)
@@ -231,7 +278,7 @@ def draw(snaps, K, path, days):
     for s in bx.spines.values():
         s.set_color("#2b323d")
     bx.grid(alpha=0.09, color="white", lw=0.5, axis="x")
-    bx.annotate("빨강 = 롱 청산(가격 아래)\n파랑 = 숏 청산(가격 위)", (0.97, 0.015),
+    bx.annotate("빨강 = 기준가격 아래\n파랑 = 기준가격 위", (0.97, 0.015),
                 xycoords="axes fraction", color="#7b8494", fontsize=9,
                 ha="right", va="bottom")
 
@@ -260,55 +307,16 @@ def zone_series(snaps, lo, hi):
     return out
 
 
-def approach(K, lo, hi, since, above):
-    """since 이후 가격이 그 칸 쪽으로 얼마나 갔나. (도달 극단값, 칸에 들어왔는지)
-
-    칸이 현재가 위면 고가의 최대치, 아래면 저가의 최소치가 관심사다.
-    칸 안에 들어온 봉의 반대쪽 끝을 집으면 안 된다.
-    """
-    ext = None
-    for t, h, l in zip(K["t"], K["h"], K["l"]):
-        if t / 1000 < since:
-            continue
-        v = h if above else l
-        if ext is None or (v > ext if above else v < ext):
-            ext = v
-    if ext is None:
-        return None, False
-    return ext, lo <= ext < hi
+def approach(K,lo,hi,since,above):
+    bars=[(h,l) for t,h,l in zip(K['t'],K['h'],K['l']) if t/1000>=since]
+    if not bars:
+        return None,False
+    return (max(h for h,l in bars) if above else min(l for h,l in bars),
+            any(h>=lo and l<hi for h,l in bars))
 
 
-def fate(path_then, path_now, lo, hi):
-    """그때 그 칸에 있던 계정들이 지금 어떻게 됐나.
-
-    stay_now 는 남아 있는 계정의 '지금' 물량이다. 현재 칸 물량에서 이걸 빼면
-    그 뒤에 새로 들어온 양이 나온다 — 물량이 늘었을 때 갈아탄 건지
-    원래 있던 게 버틴 건지 갈린다.
-    """
-    A, B = load_full(path_then), load_full(path_now)
-    coh = {a: v for a, v in A.items()
-           if v["liq"] is not None and lo <= v["liq"] < hi}
-    if not coh:
-        return None
-    r = {"n": len(coh), "btc": sum(abs(v["sz"]) for v in coh.values()),
-         "gone": [0, 0.0], "moved": [0, 0.0], "stay": [0, 0.0],
-         "grew": 0, "cut": 0, "stay_now": 0.0}
-    for a, v in coh.items():
-        n = B.get(a)
-        if n is None or n["sz"] == 0:
-            k = "gone"
-        elif n["liq"] is not None and lo <= n["liq"] < hi:
-            k = "stay"
-            r["stay_now"] += abs(n["sz"])
-        else:
-            k = "moved"
-            if abs(n["sz"]) > abs(v["sz"]) * 1.05:
-                r["grew"] += 1
-            elif abs(n["sz"]) < abs(v["sz"]) * 0.95:
-                r["cut"] += 1
-        r[k][0] += 1
-        r[k][1] += abs(v["sz"])
-    return r
+def fate(path_then,path_now,lo,hi):
+    return tracking.fate(path_then,path_now,lo,hi)
 
 
 def josa(n, pair=("으로", "로")):
@@ -320,162 +328,48 @@ def josa(n, pair=("으로", "로")):
     return pair[0] if int(n) % 10 in (0, 3, 6) else pair[1]
 
 
-def origin(path_then, path_now, lo, hi):
-    """지금 이 칸에 있는 물량이 어디서 왔나. 셋은 성격이 전혀 다르다.
-
-      held      하루 전에도 이 칸에 있었다 — 그대로 버틴 것
-      moved_in  하루 전에도 포지션은 있었는데 청산가가 다른 칸이었다
-                — 새 돈이 아니다. 가격이 밀려오면서 청산가가 따라 들어온 것
-      new       하루 전에는 포지션 자체가 없었다 — 진짜 신규
-
-    이걸 안 가르면 셋이 전부 '새로 들어온 물량' 으로 뭉뚱그려진다.
-    실제로 $72,000 칸의 601 BTC 는 새 돈이 아니라 기존 롱의 청산가가
-    가격 쪽으로 올라온 것이었다.
-    """
-    A, B = load_full(path_then), load_full(path_now)
-    r = {"held": [0, 0.0], "moved_in": [0, 0.0], "new": [0, 0.0]}
-    for a, x in B.items():
-        if x["liq"] is None or not (lo <= x["liq"] < hi):
-            continue
-        p = A.get(a)
-        if p is None or p["sz"] == 0:
-            k = "new"
-        elif p["liq"] is not None and lo <= p["liq"] < hi:
-            k = "held"
-        else:
-            k = "moved_in"
-        r[k][0] += 1
-        r[k][1] += abs(x["sz"])
-    return r
+def origin(path_then,path_now,lo,hi):
+    return tracking.origin(path_then,path_now,lo,hi)
 
 
-def narrate(snaps, K, cur, hours=24):
-    """가장 큰 자리가 그동안 어떻게 변했는지, 줄었다면 청산인지 이탈인지."""
-    if len(snaps) < 3:
+def narrate(snaps, M, cur, hours=24):
+    if len(snaps)<2:
         return []
-
-    then = min(snaps, key=lambda s: abs(
-        (snaps[-1]["ts"] - s["ts"]).total_seconds() - hours * 3600))
-    if then is snaps[-1]:
-        then = snaps[0]
-
-    # 두 가지를 본다. 제일 큰 자리는 멀리 있을 수 있고(현재 -9% 에 1,385 BTC),
-    # 가까운 자리는 작아도 실제로 밟힐 자리다. 하나만 고르면 다른 쪽이 안 보인다.
-    def peak(src, px, span):
-        c = collections.Counter()
-        for sz, liq in src["pos"]:
-            if liq is None or abs(liq - px) / px > span:
-                continue
-            c[int(liq // BIN) * BIN] += abs(sz)
-        if not c:
-            return None
-        # 군집은 한 칸보다 넓다. 3칸 창의 합이 가장 큰 봉우리를 고른다
-        return max(c, key=lambda b: sum(c.get(b + k * BIN, 0) for k in (-1, 0, 1)))
-
-    cands = []
-    big = peak(snaps[-1], cur, 0.15)
-    near = peak(snaps[-1], cur, 0.035)
-    if big is not None:
-        cands.append((big, "가장 큰 자리"))
-    if near is not None:
-        cands.append((near, "가장 가까운 자리"))
-
-    zones = []
-    for b, tag in cands:
-        if all(abs(b - z) > 2 * BIN for z, _ in zones):   # 겹치면 같은 군집이다
-            zones.append((b, tag))
-
-    NOW = load_full(snaps[-1]["path"])
-    out = []
-    for b, tag in zones[:2]:
-        # 실제 군집은 $250 한 칸보다 넓게 퍼져 있다. 봉우리 칸 좌우를 묶는다.
-        lo, hi = b - BIN, b + 2 * BIN
-        ser = zone_series(snaps, lo, hi)
-        i0 = ser.index(next(x for x in ser if x[0] == then["ts"]))
-        v0, vN = ser[i0][2], ser[-1][2]
-        above = b > cur
-        chg = (vN - v0) / v0 * 100 if v0 else 0.0
-        near, hit = approach(K, lo, hi, then["ts"].timestamp(), above)
-        f = fate(then["path"], snaps[-1]["path"], lo, hi)
-        mem = sorted((abs(x["sz"]) for x in NOW.values()
-                      if x["liq"] is not None and lo <= x["liq"] < hi), reverse=True)
-
-        out.append("")
-        out.append("**%s — $%s~%s**  (현재가 %+.1f%%)"
-                   % (tag, format(lo, ","), format(hi, ","),
-                      (b - cur) / cur * 100))
-
-        # 한 문장: 무엇이 얼마나 걸려 있고, 몇 명이 나눠 갖고 있나.
-        s1 = ("터지면 강제 %s가 나올 %s %s BTC($%sM)가 걸려 있"
-              % ("매수" if above else "매도", "숏" if above else "롱",
-                 format(vN, ",.0f"), format(vN * cur / 1e6, ",.0f")))
-        if mem:
-            share = mem[0] / sum(mem)
-            if share >= 0.5:
-                s1 += ("고, %d개 계정 중 하나가 %s BTC로 %.0f%%를 차지한다 — "
-                       "그 한 명이 빠지면 절반이 사라진다."
-                       % (len(mem), format(mem[0], ",.0f"), share * 100))
-            else:
-                s1 += ("고, %d개 계정이 나눠 가져 가장 큰 하나도 %.0f%%에 그친다."
-                       % (len(mem), share * 100))
-        else:
-            s1 += "다."
-        out.append(s1)
-
-        # 한 문장: 하루 사이 어떻게 변했고, 가격이 실제로 닿았나.
-        cl = ["하루 전 %s BTC에서 %.0f%% %s"
-              % (format(v0, ",.0f"), abs(chg), "불었" if chg > 0 else "줄었")]
-        cl[-1] += "고"
-        if near is not None:
-            cl.append("가격은 $%s까지%s"
-                      % (format(near, ",.0f"),
-                         (" 올라 이 구간 안으로 들어왔다" if above
-                          else " 내려 이 구간 안으로 들어왔다") if hit else
-                         ("밖에 못 올라가 이 구간에는 닿지 않았다" if above
-                          else "밖에 못 내려가 이 구간에는 닿지 않았다")))
-        out.append(" ".join(cl).rstrip(" 고는데") + ".")
-
-        # 지금 물량의 출처. 셋을 안 가르면 전부 "새로 들어온 것" 으로 뭉개진다.
-        o = origin(then["path"], snaps[-1]["path"], lo, hi)
-        if vN > 0 and chg > 10:
-            piece = []
-            for k, lab in (("held", "그대로 버틴"), ("moved_in", "청산가가 옮겨 들어온"),
-                           ("new", "새로 잡힌")):
-                if o[k][1] / vN >= 0.08:
-                    piece.append("%s %s" % (lab, format(o[k][1], ",.0f")))
-            if len(piece) >= 2:
-                last = piece[-1].split()[-1].replace(",", "")
-                out.append("지금 %s BTC는 %s%s 나뉜다."
-                           % (format(vN, ",.0f"), ", ".join(piece), josa(last)))
-            # 총량 대비가 아니라 둘을 맞대야 한다. 늘어난 몫이 어디서 왔는지가 질문이다.
-            mi, nw = o["moved_in"][1], o["new"][1]
-            if mi > nw * 2 and mi / vN >= 0.25:
-                out.append("새로 잡힌 것은 거의 없다 — 원래 있던 %s의 청산가가 "
-                           "가격 쪽으로 %s 것이다."
-                           % ("숏" if above else "롱",
-                              "밀려 내려온" if above else "밀려 올라온"))
-            elif nw > mi * 1.5 and nw / vN >= 0.25:
-                out.append("상당 부분이 새로 잡힌 %s이다."
-                           % ("숏" if above else "롱"))
-
-        # 마지막 문장은 갈리는 대목일 때만. 뻔하면 안 쓴다.
-        if f:
-            turn = f["stay"][0] / f["n"] if f["n"] else 1.0
-            if chg <= -25 and not hit:
-                out.append("가격이 닿지도 않았는데 줄었으니 청산이 아니라 스스로 뺀 것이다.")
-            elif chg <= -25:
-                out.append("가격이 닿은 뒤 줄었는데, 하루 전 %d개 중 %d개는 포지션을 닫았고 "
-                           "%d개는 청산가만 옮겼다 — 청산과 이탈이 섞여 있다."
-                           % (f["n"], f["gone"][0], f["moved"][0]))
-            elif chg >= 25 and turn < 0.3 and o["new"][1] / max(vN, 1) >= 0.4:
-                out.append("원래 있던 %d개 중 %d개만 남고 대부분이 새로 잡힌 포지션이니, "
-                           "자리는 같아도 사람이 통째로 바뀌었다."
-                           % (f["n"], f["stay"][0]))
-    if out:
-        out.append("")
-        out.append("-# 청산가는 하이퍼리퀴드가 계산한 값이다. cross 계정은 그 포지션이 아니라 "
-                   "계좌 전체 담보 기준이라 \"여기서 이 계좌가 무너진다\"에 가깝다. "
-                   "가격이 도착하기 전에 스스로 빠지는 물량이 많으니 예약된 체결로 읽으면 안 된다.")
+    now=snaps[-1]
+    then=min(snaps[:-1],key=lambda s:abs((now['ts']-s['ts']).total_seconds()-hours*3600))
+    gap=(now['ts']-then['ts']).total_seconds()/3600
+    def peak(span):
+        c=bin_vol(now,cur,span)
+        return max(c,key=lambda b:sum(c.get(b+k*BIN,0) for k in (-1,0,1))) if c else None
+    zones=[]
+    for b in (peak(.15),peak(.035)):
+        if b is not None and all(abs(b-z)>2*BIN for z in zones):
+            zones.append(b)
+    out=[]
+    for b in zones:
+        lo,hi=b-BIN,b+2*BIN
+        members=[x for x in load_full(now['path']).values() if x['liq'] is not None and lo<=x['liq']<hi]
+        total=sum(abs(x['sz']) for x in members)
+        prev=sum(abs(x['sz']) for x in load_full(then['path']).values() if x['liq'] is not None and lo<=x['liq']<hi)
+        out.append(f"\n**${lo:,}~{hi:,}** 관측 {total:,.1f} BTC ({gap:.1f}시간 전 {prev:,.1f} BTC).")
+        if total:
+            largest=max(abs(x['sz']) for x in members)
+            out.append(f"{len(members)}개 계정 중 최대 계정 {largest:,.1f} BTC ({largest/total:.0%}).")
+        o=origin(then['path'],now['path'],lo,hi)
+        labels={'held':'같은 구간 기존 수량','moved_in':'다른 구간에서 이동한 기존 수량',
+                'added':'동일 방향 수량 순증','flipped':'방향 전환 후 수량','new':'BTC 신규 관측(이전 미보유 확인)',
+                'unknown':'이전 상태 미확인','became_available':'청산가 표시 전환'}
+        pieces=[f'{lab} {o[k][1]:,.1f}' for k,lab in labels.items() if o[k][1]>=.1]
+        if pieces:
+            out.append('현재 물량 구성(BTC): '+', '.join(pieces)+'.')
+        out.append(contact(M,lo,hi,then['ts'].timestamp(),now['ts'].timestamp())+'.')
+        f=fate(then['path'],now['path'],lo,hi)
+        if f and total<prev:
+            labs={'closed':'미보유 확인','reduced':'수량 축소','flipped':'방향 전환',
+                  'moved':'청산가 이동','unavailable':'청산가 미제공 전환','unknown':'현재 조회 미확인'}
+            parts=[f'{lab} {f[k][1]:,.1f}' for k,lab in labs.items() if f[k][1]>=.1]
+            if parts:
+                out.append('이전 물량 변화(BTC): '+', '.join(parts)+'. 실제 청산 여부는 미확인.')
     return out
 
 
@@ -496,141 +390,106 @@ def span_range(K, t0, t1):
     return (min(ls), max(hs)) if hs else (None, None)
 
 
-def find_liquidation(snaps, K, within_h=24):
-    """가격이 실제로 통과한 칸에서 물량이 사라졌는지 찾는다.
-
-    이 프로젝트가 던진 질문 자체다. 지도에서 물량이 빠지는 것은 흔한데,
-    그중 '가격이 그 자리를 지나갔고 그때 없어진 것' 만이 진짜 청산이다.
-    통과하지 않았는데 빠졌으면 자발적 이탈이다.
-    """
-    best = None
-    cut = snaps[-1]["ts"].timestamp() - within_h * 3600
-    for i in range(len(snaps) - 1):
-        a, b = snaps[i], snaps[i + 1]
-        if b["ts"].timestamp() < cut:      # 최근 것만 소식이다
+def find_liquidation(snaps, M, within_h=24):
+    """Observed decrease near a mark contact; never confirmation of liquidation."""
+    best=None
+    for a,b in zip(snaps,snaps[1:]):
+        if (snaps[-1]['ts']-b['ts']).total_seconds()>within_h*3600:
             continue
-        lo_p, hi_p = span_range(K, a["ts"].timestamp(), b["ts"].timestamp())
-        if lo_p is None:
+        if (b['ts']-a['ts']).total_seconds()>90*60:
             continue
-        va = bin_vol(a, a["px"], 0.10)
-        for bn, v in va.items():
-            if v < 80:                      # 너무 얇으면 잡음이다
+        for bn,v in bin_vol(a,a['px'],.10).items():
+            if v<80:
                 continue
-            if not (lo_p <= bn + BIN / 2 <= hi_p):   # 가격이 그 칸을 지났나
-                continue
-            vb = bin_vol(b, b["px"], 0.10).get(bn, 0.0)
-            drop = (v - vb) / v
-            if drop < 0.6:
-                continue
-            if best is None or v * drop > best[0]:
-                best = (v * drop, i, bn, v, vb, a, b)
-    if best is None:
-        return None
-
-    _, _, bn, v, vb, a, b = best
-    A, B = load_full(a["path"]), load_full(b["path"])
-    coh = {k: x for k, x in A.items()
-           if x["liq"] is not None and bn <= x["liq"] < bn + BIN}
-    gone = sum(abs(x["sz"]) for k, x in coh.items()
-               if k not in B or B[k]["sz"] == 0)
-    moved = sum(abs(x["sz"]) for k, x in coh.items()
-                if k in B and B[k]["sz"] != 0
-                and not (B[k]["liq"] is not None
-                         and bn <= B[k]["liq"] < bn + BIN))
-    return {"bin": bn, "before": v, "after": vb, "gone": gone, "moved": moved,
-            "n": len(coh), "t": b["ts"]}
+            vb=sum(abs(q) for q,l in b['pos'] if l is not None and bn<=l<bn+BIN)
+            state=contact(M,bn,bn+BIN,a['ts'].timestamp(),b['ts'].timestamp())
+            if vb<=v*.4 and ('내부' in state or '관통' in state):
+                item={'bin':bn,'before':v,'after':vb,'t':b['ts'],'contact':state}
+                if best is None or v-vb>best['before']-best['after']:
+                    best=item
+    return best
 
 
-def alerts(snaps, K, cur, hours=24):
-    """조건이 맞을 때만 뜨는 것들. 평소에는 아무것도 안 뜬다."""
-    out = []
-    if len(snaps) < 4:
-        return out
-    then = min(snaps, key=lambda s: abs(
-        (snaps[-1]["ts"] - s["ts"]).total_seconds() - hours * 3600))
-    now, prev = snaps[-1], snaps[-2]
-    vn, v0, vp = (bin_vol(now, cur), bin_vol(then, cur), bin_vol(prev, cur))
-
-    # ① 가격이 실제로 지나간 자리에서 물량이 사라졌나 — 진짜 청산
-    liq = find_liquidation(snaps, K)
+def alerts(snaps,M,cur,hours=24):
+    if len(snaps)<2:
+        return []
+    now,prev=snaps[-1],snaps[-2]
+    gap=(now['ts']-prev['ts']).total_seconds()/3600
+    changes=tracking.position_changes(prev['path'],now['path'])
+    out=[]
+    def side(q):
+        return '롱' if q>0 else '숏'
+    def lp(x):
+        return f"${x['liq']:,.2f}" if x['liq'] is not None else '미제공'
+    for kind,label in (('flipped','방향 전환'),('expanded','포지션 확대'),('reduced','포지션 축소')):
+        entries=changes[kind]
+        if entries:
+            r=entries[0]
+            a,b=r['before'],r['after']
+            addr=r['addr'][:8]+'…'+r['addr'][-4:]
+            out.append(f"**{label}** 직전 {gap:.1f}시간 비교에서 {len(entries)}개 계정. 최대 변화 {addr}: "
+                       f"{side(a['sz'])} {abs(a['sz']):,.2f} → {side(b['sz'])} {abs(b['sz']):,.2f} BTC, "
+                       f"청산가 {lp(a)} → {lp(b)}.")
+    liq=find_liquidation(snaps,M)
     if liq:
-        out.append("**청산 흔적** $%s~%s 칸을 가격이 통과했고 %s → %s BTC 로 빠졌다. "
-                   "%d개 계정 중 %s BTC 는 포지션이 사라졌고 %s BTC 는 청산가만 옮겼다. "
-                   "(%s KST)"
-                   % (format(liq["bin"], ","), format(liq["bin"] + BIN, ","),
-                      format(liq["before"], ",.0f"),
-                      format(liq["after"], ",.0f"), liq["n"],
-                      format(liq["gone"], ",.0f"), format(liq["moved"], ",.0f"),
-                      kst(liq["t"]).strftime("%m/%d %H:%M")))
-
-    # ② 없던 자리에 새로 생긴 군집
-    fresh = [(b, v) for b, v in vn.items() if v >= 200 and v0.get(b, 0) < 50]
+        out.append(f"**관측 물량 감소** ${liq['bin']:,}~{liq['bin']+BIN:,}: {liq['before']:,.1f} → {liq['after']:,.1f} BTC. "
+                   f"{liq['contact']}. 실제 청산 여부는 미확인.")
+    # Preserve the concentration warning; no assumption of independent wallets.
+    vn=bin_vol(now,cur)
+    then=min(snaps[:-1],key=lambda s:abs((now['ts']-s['ts']).total_seconds()-hours*3600))
+    baseline_gap=(now['ts']-then['ts']).total_seconds()/3600
+    v0=bin_vol(then,cur)
+    fresh=[(b,v) for b,v in vn.items() if v>=200 and v0.get(b,0)<50]
     if fresh:
-        b, v = max(fresh, key=lambda x: x[1])
-        out.append("**새 군집** $%s~%s 에 %s BTC 가 새로 생겼다. 하루 전에는 %s BTC 였다. (%+.1f%%)"
-                   % (format(b, ","), format(b + BIN, ","), format(v, ",.0f"),
-                      format(v0.get(b, 0), ",.0f"), (b - cur) / cur * 100))
-
-    # ③ 한 계정이 그 칸을 사실상 혼자 채우고 있나
-    B = load_full(now["path"])
-    for b, v in sorted(vn.items(), key=lambda x: -x[1])[:3]:
-        if v < 150:
+        bn,v=max(fresh,key=lambda x:x[1])
+        out.append(f"**관측 군집 증가** ${bn:,}~{bn+BIN:,}: {baseline_gap:.1f}시간 전 {v0.get(bn,0):,.1f} → {v:,.1f} BTC. 신규 자금 유입을 의미하지는 않습니다.")
+    B=load_full(now['path'])
+    for bn,v in sorted(vn.items(),key=lambda x:-x[1])[:3]:
+        mem=[abs(x['sz']) for x in B.values() if x['liq'] is not None and bn<=x['liq']<bn+BIN]
+        if v>=150 and mem and max(mem)>=sum(mem)*.5:
+            out.append(f"**한 계정이 절반 이상** ${bn:,}~{bn+BIN:,}: {sum(mem):,.1f} BTC 중 최대 계정 {max(mem)/sum(mem):.0%}.")
             break
-        mem = [abs(x["sz"]) for x in B.values()
-               if x["liq"] is not None and b <= x["liq"] < b + BIN]
-        if mem and max(mem) / sum(mem) >= 0.5:
-            out.append("**한 명이 절반** $%s~%s 의 %s BTC 중 %s BTC 가 계정 하나다 (%.0f%%). "
-                       "군집이 아니라 큰 한 명이다."
-                       % (format(b, ","), format(b + BIN, ","), format(v, ",.0f"),
-                          format(max(mem), ",.0f"), max(mem) / sum(mem) * 100))
+    def balance(s):
+        px=s['px']
+        return (sum(abs(q) for q,l in s['pos'] if l is not None and px<l<=px*1.03),
+                sum(abs(q) for q,l in s['pos'] if l is not None and px*.97<=l<px))
+    u1,d1=balance(now)
+    u0,d0=balance(then)
+    if min(u1,d1,u0,d0)>30 and (u1>d1)!=(u0>d0):
+        out.append(f"**균형 반전** 각 시점 기준가격 ±3% 물량(위:아래): {u0:,.0f}:{d0:,.0f} → {u1:,.0f}:{d1:,.0f} BTC.")
+    for bn,v in sorted(vn.items(),key=lambda x:-x[1])[:5]:
+        old=v0.get(bn,0)
+        if old>=50 and v>=old*1.4 and abs(bn-cur)>abs(bn-then['px'])*1.3:
+            out.append(f"**멀어지는데 쌓인다** ${bn:,}~{bn+BIN:,}: 가격에서 멀어졌으나 관측 물량 {old:,.1f} → {v:,.1f} BTC.")
             break
-
-    # ④ 위아래 연료 균형이 뒤집혔나
-    def bal(vv, px):
-        u = sum(x for bb, x in vv.items() if px < bb <= px * 1.03)
-        d = sum(x for bb, x in vv.items() if px * 0.97 <= bb < px)
-        return u, d
-    u1, d1 = bal(vn, cur)
-    u0, d0 = bal(v0, then["px"])
-    if min(u1, d1, u0, d0) > 30:
-        if (u0 > d0) != (u1 > d1):
-            out.append("**균형 반전** ±3%% 안 연료가 하루 전 %s(위):%s(아래) 였는데 "
-                       "지금 %s:%s 로 뒤집혔다."
-                       % (format(u0, ",.0f"), format(d0, ",.0f"),
-                          format(u1, ",.0f"), format(d1, ",.0f")))
-
-    # ⑤ 가격이 멀어지는데 오히려 쌓이는 자리
-    for b, v in sorted(vn.items(), key=lambda x: -x[1])[:5]:
-        o = v0.get(b, 0)
-        if o < 50 or v < o * 1.4:
-            continue
-        d_now, d_then = abs(b - cur), abs(b - then["px"])
-        if d_now > d_then * 1.3:
-            out.append("**멀어지는데 쌓인다** $%s~%s 는 가격에서 멀어졌는데도 "
-                       "%s → %s BTC 로 늘었다."
-                       % (format(b, ","), format(b + BIN, ","),
-                          format(o, ",.0f"), format(v, ",.0f")))
-            break
-
-    # ⑥ 한 시간 만에 현재가 주변 총량이 크게 변했나
-    tn, tp = sum(vn.values()), sum(vp.values())
-    if tp > 200 and abs(tn - tp) / tp >= 0.35:
-        out.append("**한 시간 급변** 현재가 ±6%% 안 총량이 %s → %s BTC (%+.0f%%)."
-                   % (format(tp, ",.0f"), format(tn, ",.0f"),
-                      (tn - tp) / tp * 100))
-
-    return out[:4]
+    previous_total=sum(bin_vol(prev,cur).values())
+    current_total=sum(vn.values())
+    if previous_total>200 and abs(current_total/previous_total-1)>=.35:
+        out.append(f"**관측 물량 급변** 직전 {gap:.1f}시간, 현재 기준가격 ±6% 물량 {previous_total:,.1f} → {current_total:,.1f} BTC. 조회 미확인 물량에 유의하세요.")
+    return out
 
 
-def summary(snaps, cur, extra=None):
-    """머리말 한 줄과 본문. 숫자 표는 빼고 서술만 남긴다 —
-    같은 값이 아래 서술에 문장으로 다시 나오고, 표는 잘 안 읽힌다."""
-    s = snaps[-1]
-    prev = snaps[-2]["px"] if len(snaps) > 1 else cur
-    chg = (cur - prev) / prev * 100
-    head = ("**BTC $%s**  (%+.2f%% / 1h)   ·   %s KST"
-            % (format(cur, ",.0f"), chg, kst(s["ts"]).strftime("%m-%d %H:%M")))
-    return "\n".join([head] + (extra or []))
+def summary(snaps,cur,extra=None,github_failed=False):
+    s=snaps[-1]
+    info=tracking.status_info(s['path'])
+    head=[]
+    if github_failed:
+        head.append('⚠️ 이번 수집 데이터의 GitHub 저장에 실패했습니다. 이미지·브리핑은 서버 자료로 작성했지만 원본은 이후 분석에서 빠질 수 있습니다.')
+    head.append(f"**BTC 기준가격 ${cur:,.2f}** · 수집 완료 {kst(s['ts']):%m-%d %H:%M} KST")
+    if info:
+        start=kst(datetime.fromisoformat(info['started_at']))
+        price=info['price']
+        pt=kst(datetime.fromtimestamp(price['t']/1000,timezone.utc))
+        c=info['counts']
+        head.append(f"수집 {start:%H:%M}~{kst(s['ts']):%H:%M}, 마크가격 관측 {pt:%H:%M:%S}. "
+                    f"조회 성공 {c['ok_btc']+c['ok_no_btc']:,}/{c['requested']:,}.")
+        if c['failed']:
+            head.append(f"⚠️ 재조회 후에도 {c['failed']:,}개 계정 미확인. 물량 감소·신규 여부를 단정하지 않습니다.")
+        if info.get('end_price_error'):
+            head.append('⚠️ 완료 시 가격 조회 실패: 수집 시작 시 마크가격을 표시합니다.')
+    else:
+        head.append('과거 자료: 지갑별 조회 성공 여부 미기록. 기준가격은 수집 시작 부근의 값입니다.')
+    return '\n'.join(head+(extra or []))
 
 
 def post(url, text, png):
@@ -643,12 +502,19 @@ def post(url, text, png):
     w("--%s\r\n" % b)
     w('Content-Disposition: form-data; name="payload_json"\r\n')
     w("Content-Type: application/json\r\n\r\n")
-    w(json.dumps({"content": text}) + "\r\n")
+    payload={"content":text if len(text)<=1900 else text[:1800]+"\n…전체 브리핑은 첨부 파일을 확인하세요.",
+             "allowed_mentions":{"parse":[]}}
+    w(json.dumps(payload) + "\r\n")
     w("--%s\r\n" % b)
     w('Content-Disposition: form-data; name="files[0]"; filename="liqmap.png"\r\n')
     w("Content-Type: image/png\r\n\r\n")
     with open(png, "rb") as f:
         w(f.read())
+    if len(text)>1900:
+        w("\r\n--%s\r\n" % b)
+        w('Content-Disposition: form-data; name="files[1]"; filename="briefing.txt"\r\n')
+        w("Content-Type: text/plain; charset=utf-8\r\n\r\n")
+        w(text)
     w("\r\n--%s--\r\n" % b)
 
     req = urllib.request.Request(
@@ -660,37 +526,50 @@ def post(url, text, png):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/tmp/liqmap.png")
-    ap.add_argument("--days", type=int, default=DAYS)
-    ap.add_argument("--dry", action="store_true", help="그리기만 하고 보내지 않는다")
-    a = ap.parse_args()
-
-    snaps = load_snapshots(a.days)
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--out',default='/tmp/liqmap.png')
+    ap.add_argument('--days',type=int,default=DAYS)
+    ap.add_argument('--since',default=SINCE)
+    ap.add_argument('--as-of',help='UTC ISO timestamp for reproducible rendering')
+    ap.add_argument('--dry',action='store_true',help='do not send to Discord')
+    ap.add_argument('--offline',action='store_true',help='no network, implies dry')
+    ap.add_argument('--github-failed',action='store_true')
+    ap.add_argument('--text-out')
+    ap.add_argument('--snapshot',help='report this completed snapshot even if another writer published later')
+    args=ap.parse_args()
+    end=datetime.fromisoformat(args.as_of) if args.as_of else datetime.now(timezone.utc)
+    if args.snapshot:
+        with gzip.open(args.snapshot,'rt',encoding='utf-8',newline='') as f:
+            end=datetime.fromisoformat(next(csv.reader(f))[1])
+    if end.utcoffset() is None:
+        ap.error('--as-of needs a timezone')
+    snaps=load_snapshots(args.days,end,args.since)
     if not snaps:
-        print("스냅샷 없음")
+        print('스냅샷 없음')
         return 1
-    K = candles(snaps[0]["ts"].timestamp(),
-                datetime.now(timezone.utc).timestamp())
-    cur = draw(snaps, K, a.out, a.days)
-    body = narrate(snaps, K, cur)
-    al = alerts(snaps, K, cur)
-    if al:
-        body = ["", "**눈에 띄는 것**"] + ["· " + a for a in al] + body
-    text = summary(snaps, cur, body)
+    K=candles(snaps[0]['ts'].timestamp(),end.timestamp(),args.offline)
+    M=load_marks(snaps[0]['ts'].timestamp(),end.timestamp())
+    draw(snaps,K,args.out,args.days,M)
+    cur=snaps[-1]['px']
+    body=narrate(snaps,M,cur)
+    al=alerts(snaps,M,cur)
+    extra=[]
+    if not K['t']:
+        extra.append('⚠️ 하이퍼리퀴드 가격 캔들 없음: 가격 움직임 해석 불가.')
+    extra.extend(al+body)
+    text=summary(snaps,cur,extra,args.github_failed)
     print(text)
-    print("-> %s" % a.out)
-
-    if a.dry:
+    if args.text_out:
+        Path(args.text_out).write_text(text,encoding='utf-8')
+    if args.dry or args.offline:
         return 0
     if not os.path.exists(WEBHOOK_FILE):
-        print("[건너뜀] 웹훅 파일이 없다: %s" % WEBHOOK_FILE)
+        print('[건너뜀] 웹훅 파일 없음')
         return 0
-    url = open(WEBHOOK_FILE).read().strip()
-    if not url:
-        print("[건너뜀] 웹훅이 비어 있다")
-        return 0
-    print("디스코드 전송: %s" % post(url, text, a.out))
+    with open(WEBHOOK_FILE,encoding='utf-8') as f:
+        url=f.read().strip()
+    if url:
+        print('디스코드 전송:',post(url,text,args.out))
     return 0
 
 

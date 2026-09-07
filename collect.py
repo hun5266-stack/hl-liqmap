@@ -15,11 +15,15 @@ import csv
 import gzip
 import io
 import json
+import math
 import os
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
+import market
 
 INFO = "https://api.hyperliquid.xyz/info"
 LEADERBOARD = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -40,7 +44,7 @@ WORKERS = 36
 
 # 중복 실행을 막는 기본 간격. 실행 주체마다 달라서 --min-gap 으로 덮어쓴다.
 #
-# VPS 는 정시 슬롯의 주인이라 40분을 쓴다. 전수 스캔이 18분 걸려 스냅샷이
+# VPS 는 정시 슬롯의 주인이라 30분을 쓴다. 전수 스캔이 18분 걸려 스냅샷이
 # HH:18 에 찍히고 다음 정시에는 42분 전으로 보인다. 기본값 45분이면 매번
 # 걸러져 두 시간에 한 번밖에 못 돈다.
 #
@@ -49,17 +53,25 @@ WORKERS = 36
 MIN_GAP_MIN = 45
 
 
+class RequestFailure(Exception):
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__(str(errors[-1]))
+
+
 def post(body, tries=3):
+    errors = []
     for i in range(tries):
         try:
             req = urllib.request.Request(INFO, data=json.dumps(body).encode(), headers=UA)
             with urllib.request.urlopen(req, timeout=20) as r:
-                return json.load(r)
-        except Exception:
-            if i == tries - 1:
-                return None
-            time.sleep(0.5 * (i + 1))
-    return None
+                return json.load(r), i+1, errors
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            errors.append({'kind':type(exc).__name__, 'code':getattr(exc,'code',None),
+                           'message':str(exc)[:250]})
+            if i < tries-1:
+                time.sleep(2 ** i)
+    raise RequestFailure(errors)
 
 
 def btc_price():
@@ -69,69 +81,82 @@ def btc_price():
     그리고 청산가를 계산하는 주체가 하이퍼리퀴드이므로, 기준 가격도
     같은 곳에서 받아야 지도와 가격이 어긋나지 않는다.
     """
-    d = post({"type": "metaAndAssetCtxs"})
-    if d:
-        try:
-            i = next(k for k, u in enumerate(d[0]["universe"]) if u["name"] == "BTC")
-            return float(d[1][i]["markPx"])
-        except (StopIteration, KeyError, TypeError, ValueError):
-            pass
-    d = post({"type": "allMids"})
-    if d and "BTC" in d:
-        return float(d["BTC"])
-    raise RuntimeError("BTC 가격 조회 실패")
+    d, _, _ = post({'type':'metaAndAssetCtxs'})
+    i = next(i for i,u in enumerate(d[0]['universe']) if u['name']=='BTC')
+    px = float(d[1][i]['markPx'])
+    if not math.isfinite(px) or px<=0:
+        raise ValueError('invalid mark price')
+    return {'t':int(time.time()*1000),'px':px,'source':'hyperliquid_mark'}
 
 
 def leaderboard():
     req = urllib.request.Request(LEADERBOARD, headers={"User-Agent": UA["User-Agent"]})
     with urllib.request.urlopen(req, timeout=180) as r:
         d = json.load(r)
-    rows = d.get("leaderboardRows", d)
-    return [x["ethAddress"] for x in rows]
+    rows = d.get('leaderboardRows') if isinstance(d,dict) else d
+    if not isinstance(rows,list) or not rows:
+        raise ValueError('빈 리더보드 또는 잘못된 응답')
+    addrs = [x['ethAddress'].lower() for x in rows]
+    if any(len(a)!=42 or not a.startswith('0x') for a in addrs):
+        raise ValueError('잘못된 리더보드 주소')
+    for a in addrs:
+        int(a[2:],16)
+    return sorted(set(addrs))
 
 
 def fetch(addr):
-    """한 주소의 BTC 포지션. 없으면 None."""
-    st = post({"type": "clearinghouseState", "user": addr})
-    if not st:
-        return None
-    for p in st.get("assetPositions", []):
-        z = p["position"]
-        if z["coin"] != "BTC":
-            continue
-        sz = float(z["szi"] or 0)
-        ep = float(z.get("entryPx") or 0)
-        if not sz or not ep:
-            continue
-        lev = z.get("leverage") or {}
-        return {
-            "a": addr,
-            "sz": sz,
-            "ep": ep,
-            "liq": float(z["liquidationPx"]) if z.get("liquidationPx") else None,
-            "lev": lev.get("value"),
-            "mt": lev.get("type"),
-            "pnl": float(z.get("unrealizedPnl") or 0),
-            "av": float(st.get("marginSummary", {}).get("accountValue") or 0),
-        }
-    return None
+    """Explicit result per address; an unsuccessful read is never no-BTC."""
+    result = {'addr':addr,'attempts':0,'errors':[],'row':None}
+    try:
+        st, result['attempts'], result['errors'] = post({'type':'clearinghouseState','user':addr})
+        if not isinstance(st,dict) or not isinstance(st.get('assetPositions'),list) or not isinstance(st.get('marginSummary'),dict):
+            raise ValueError('missing assetPositions/marginSummary')
+        positions = [p['position'] for p in st['assetPositions']]
+        btc = [z for z in positions if z['coin']=='BTC' and float(z['szi'])!=0]
+        if len(btc)>1:
+            raise ValueError('duplicate BTC position')
+        result['status'] = 'ok_no_btc'
+        if btc:
+            z = btc[0]
+            row = {'a':addr,'sz':float(z['szi']),'ep':float(z['entryPx']),
+                   'liq':float(z['liquidationPx']) if z.get('liquidationPx') is not None else None,
+                   'lev':float(z['leverage']['value']),'mt':z['leverage']['type'],
+                   'pnl':float(z['unrealizedPnl']),'av':float(st['marginSummary']['accountValue'])}
+            if row['ep']<=0 or row['lev']<=0 or row['mt'] not in ('cross','isolated') or any(not math.isfinite(row[k]) for k in ('sz','ep','pnl','av','lev')) or (row['liq'] is not None and (not math.isfinite(row['liq']) or row['liq']<=0)):
+                raise ValueError('invalid BTC position values')
+            result.update(status='ok_btc',row=row)
+    except RequestFailure as exc:
+        result.update(status='transport_error',attempts=len(exc.errors),errors=exc.errors)
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        result['status'] = 'invalid_response'
+        result['errors'].append({'kind':type(exc).__name__,'message':str(exc)[:250]})
+    result['observed_at'] = datetime.now(timezone.utc).isoformat()
+    return result
 
 
 def scan(addrs):
-    out = []
+    results = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         for r in ex.map(fetch, addrs):
-            if r:
-                out.append(r)
-    return out
+            results[r['addr']] = r
+        failed = [a for a,r in results.items() if r['status'] not in ('ok_btc','ok_no_btc')]
+        if failed:
+            time.sleep(5)
+            for r in ex.map(fetch, failed):
+                old = results[r['addr']]
+                r['attempts'] += old['attempts']
+                r['errors'] = old['errors']+r['errors']
+                r['recovered'] = r['status'] in ('ok_btc','ok_no_btc')
+                results[r['addr']] = r
+    return [r['row'] for r in results.values() if r['status']=='ok_btc'], results
 
 
-def write_snapshot(rows, px, mode, elapsed, scanned):
-    ts = datetime.now(timezone.utc)
+def write_snapshot(rows, px, mode, elapsed, scanned, audit=None):
+    ts = datetime.fromisoformat(audit['completed_at']) if audit else datetime.now(timezone.utc)
     day = ts.strftime("%Y-%m")
     outdir = os.path.join(ROOT, "data", day)
     os.makedirs(outdir, exist_ok=True)
-    name = ts.strftime("%Y%m%dT%H%M") + ("_full" if mode == "full" else "") + ".csv.gz"
+    name = ts.strftime("%Y%m%dT%H%M%S%f") + ("_full" if mode == "full" else "") + ".csv.gz"
     path = os.path.join(outdir, name)
 
     # 필터를 두지 않는다. 3주를 모으는 동안 가격이 15~20% 움직이면
@@ -140,17 +165,24 @@ def write_snapshot(rows, px, mode, elapsed, scanned):
     buf = io.StringIO()
     w = csv.writer(buf)
     # 첫 줄은 스냅샷 메타. 실제 실행 시각을 남겨야 나중에 지연을 보정할 수 있다.
-    w.writerow(["#ts", ts.isoformat(), "px", f"{px:.2f}", "mode", mode,
+    meta = ["#ts", ts.isoformat(), "px", f"{px:.2f}", "mode", mode,
                 "scanned", scanned, "btc_positions", len(rows),
-                "elapsed_s", f"{elapsed:.0f}"])
+                "elapsed_s", f"{elapsed:.0f}"]
+    if audit:
+        meta += ['schema_version',2,'started_at',audit['started_at'],
+                 'price_at',audit['price']['t'],'price_source',audit['price']['source'],
+                 'complete',str(audit['complete']).lower(),'failed',audit['counts']['failed']]
+        market.write_json_gz(path.replace('.csv.gz','.status.json.gz'),audit)
+    w.writerow(meta)
     w.writerow(["addr", "size", "entry", "liq", "lev", "margin", "pnl", "acct_value"])
     for r in rows:
         w.writerow([r["a"], f"{r['sz']:.6f}", f"{r['ep']:.2f}",
                     f"{r['liq']:.2f}" if r["liq"] else "",
                     r["lev"], r["mt"], f"{r['pnl']:.2f}", f"{r['av']:.2f}"])
 
-    with gzip.open(path, "wt", encoding="utf-8", newline="") as f:
+    with gzip.open(path+'.tmp', "wt", encoding="utf-8", newline="") as f:
         f.write(buf.getvalue())
+    os.replace(path+'.tmp',path)
 
     longs = [r for r in rows if r["sz"] > 0]
     shorts = [r for r in rows if r["sz"] < 0]
@@ -162,6 +194,9 @@ def write_snapshot(rows, px, mode, elapsed, scanned):
         "long_n": len(longs), "short_n": len(shorts),
         "elapsed_s": round(elapsed),
     }
+    if audit:
+        summary.update(complete=audit['complete'],counts=audit['counts'],
+                       started_at=audit['started_at'],price_at=audit['price']['t'])
     with open(os.path.join(ROOT, "latest.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     return path, summary
@@ -181,7 +216,7 @@ def last_snapshot_age_min():
         return None
     stamp = max(n.split("_")[0].replace(".csv.gz", "") for n in names)
     try:
-        t = datetime.strptime(stamp, "%Y%m%dT%H%M").replace(tzinfo=timezone.utc)
+        t = datetime.strptime(stamp[:13], "%Y%m%dT%H%M").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
     return (datetime.now(timezone.utc) - t).total_seconds() / 60
@@ -201,42 +236,71 @@ def main():
         return
 
     t0 = time.time()
-    px = btc_price()
+    started_at = datetime.now(timezone.utc).isoformat()
+    start_price = btc_price()
+    previous = []
+    if os.path.exists(HOLDERS):
+        with open(HOLDERS,encoding='utf-8') as f:
+            previous = [a.lower() for a in json.load(f)['addresses']]
 
     if a.full or not os.path.exists(HOLDERS):
-        addrs = leaderboard()
+        listed = leaderboard()
+        addrs = sorted(set(listed) | set(previous))
         mode = "full"
     else:
-        with open(HOLDERS, encoding="utf-8") as f:
-            addrs = json.load(f)["addresses"]
+        addrs = sorted(set(previous))
+        listed = []
         mode = "known"
 
-    rows = scan(addrs)
+    rows, results = scan(addrs)
+    price_error = None
+    try:
+        price = btc_price()
+    except Exception as exc:
+        price = start_price
+        price_error = f'{type(exc).__name__}: {exc}'[:250]
+    px = price['px']
     elapsed = time.time() - t0
-
-    if mode == "full":
-        # 스캔이 중간에 깨지면 결과가 잘린 채로 명단을 덮어쓸 수 있다.
-        # 직전 명단보다 크게 줄었으면 갱신을 건너뛴다.
-        prev_n = 0
-        if os.path.exists(HOLDERS):
-            try:
-                with open(HOLDERS, encoding="utf-8") as f:
-                    prev_n = len(json.load(f)["addresses"])
-            except Exception:
-                prev_n = 0
-        if prev_n and len(rows) < prev_n * 0.7:
-            print(f"  [경고] BTC 포지션 {len(rows):,}개가 직전 {prev_n:,}개보다 30% 이상 적다. "
-                  f"명단 갱신을 건너뛴다")
-        else:
-            with open(HOLDERS, "w", encoding="utf-8") as f:
-                json.dump({"updated": datetime.now(timezone.utc).isoformat(),
-                           "addresses": [r["a"] for r in rows]}, f)
-
-    path, s = write_snapshot(rows, px, mode, elapsed, len(addrs))
+    completed_at = datetime.now(timezone.utc).isoformat()
+    failed = [a for a,r in results.items() if r['status'] not in ('ok_btc','ok_no_btc')]
+    counts = {'requested':len(addrs),'ok_btc':len(rows),
+              'ok_no_btc':sum(r['status']=='ok_no_btc' for r in results.values()),
+              'failed':len(failed),'recovered':sum(r.get('recovered',False) for r in results.values()),
+              'attempts':sum(r['attempts'] for r in results.values())}
+    listed_set = set(listed)
+    accounts = {a:{**{k:v for k,v in r.items() if k not in ('row','addr')},
+                   'in_leaderboard':a in listed_set if mode=='full' else None}
+                for a,r in results.items()}
+    audit = {'schema_version':2,'started_at':started_at,'completed_at':completed_at,
+             'complete':not failed,'counts':counts,'price':price,'start_price':start_price,
+             'end_price_error':price_error,'accounts':accounts}
+    # A failed observation never removes a known holder. A successful no-BTC does.
+    retained = sorted({r['a'] for r in rows} | (set(previous)&set(failed)))
+    with open(HOLDERS+'.tmp','w',encoding='utf-8') as f:
+        json.dump({'updated':completed_at,'addresses':retained,'unconfirmed':failed},f)
+    os.replace(HOLDERS+'.tmp',HOLDERS)
+    path, s = write_snapshot(rows, px, mode, elapsed, len(addrs),audit)
+    # Prices are archived before GitHub publication. Recorder lives outside this repo.
+    since = t0-min((age or 60)*60,86400)
+    try:
+        points = market.read_marks(since,time.time())
+    except OSError as exc:
+        print(f'[경고] 마크가격 기록 읽기 실패: {exc}')
+        points = []
+    for p in (start_price,price):
+        points.append(p)
+    points = sorted({p['t']:p for p in points}.values(),key=lambda p:p['t'])
+    market.write_json_gz(path.replace('.csv.gz','.marks.json.gz'),points)
+    try:
+        cs = market.candle_history(since,time.time())
+        market.write_json_gz(path.replace('.csv.gz','.candles.json.gz'),cs)
+    except Exception as exc:
+        print(f'[경고] 가격 캔들 저장 실패: {type(exc).__name__}: {exc}')
     print(f"[{s['ts']}] mode={mode} px=${px:,.0f} scanned={len(addrs):,} "
           f"btc={len(rows):,} {elapsed:.0f}s")
     print(f"  long {s['long_btc']:,.0f} BTC / short {s['short_btc']:,.0f} BTC")
     print(f"  -> {os.path.relpath(path, ROOT)}")
+    print(f"  성공 {counts['ok_btc']+counts['ok_no_btc']:,} / 최종 실패 {len(failed):,} / 재조회 복구 {counts['recovered']:,}")
 
 
 if __name__ == "__main__":

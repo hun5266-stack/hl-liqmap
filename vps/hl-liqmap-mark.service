@@ -1,0 +1,16 @@
+[Unit]
+Description=Hyperliquid BTC mark price recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+# Installed outside the checkout: hourly git reset cannot disturb this process.
+ExecStart=/usr/bin/python3 /root/hl-liqmap-market.py --loop --interval 5
+Environment=LIQMAP_MARK_DIR=/root/.local/share/hl-liqmap/marks
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

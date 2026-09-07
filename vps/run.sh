@@ -20,12 +20,13 @@ echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) start ==="
 exec 9>/var/lock/hl-liqmap.lock
 flock -n 9 || { echo "이전 실행이 아직 돈다. 건너뛴다"; exit 0; }
 
-# 로컬에 아낄 상태가 없다. 스냅샷은 만들자마자 푸시하므로 항상 새로 시작한다.
+# 합의된 정책: 직전 GitHub 저장 실패 자료는 다음 실행에서 포기할 수 있다.
+# 실패 당시 디스코드 청산맵에 보존 실패 경고를 함께 보낸다.
 git rebase --abort 2>/dev/null
 git merge  --abort 2>/dev/null
 git fetch -q origin || { echo "fetch 실패"; exit 1; }
-git reset -q --hard origin/main
-git clean -qfd
+git reset -q --hard origin/main || exit 1
+git clean -qfd || exit 1
 
 newest() { ls -1 data/*/*.csv.gz 2>/dev/null | tail -1; }
 BEFORE=$(newest)
@@ -36,21 +37,25 @@ BEFORE=$(newest)
 # 겹침 방지는 위의 flock 이 맡으므로 이 값은 Actions 와의 중복만 보면 된다.
 # 인자를 넘기면 collect.py 로 그대로 전달된다 (수동 검증용: run.sh --force)
 python3 collect.py --full --min-gap 30 "$@" || { echo "수집 실패"; exit 1; }
+AFTER=$(newest)
 
 push_all() {
-  git add -A data latest.json holders.json
+  git add -A data latest.json holders.json || return 1
   if git diff --staged --quiet; then echo "변경 없음"; return 0; fi
   local MSG="snapshot $(date -u +%Y-%m-%dT%H:%MZ) [vps]"
-  git commit -q -m "$MSG"
+  git commit -q -m "$MSG" || return 1
   for i in 1 2 3; do
     if git push -q origin main; then echo "푸시 완료"; return 0; fi
+    # 마지막 실패 뒤에는 다시 reset하지 않고 서버 자료로 브리핑한다.
+    [ "$i" -eq 3 ] && break
     echo "푸시 거부 — 재정렬 $i"
-    local T=$(mktemp -d)
-    cp -a data latest.json holders.json "$T"/
-    git fetch -q origin
-    git reset -q --hard origin/main
-    cp -a "$T"/data/. data/          # 스냅샷은 이름이 겹치지 않아 양쪽 다 남는다
-    cp -a "$T"/latest.json "$T"/holders.json .
+    local T
+    T=$(mktemp -d) || return 1
+    cp -a data latest.json holders.json "$T"/ || return 1
+    git fetch -q origin || { rm -rf "$T"; return 1; }
+    git reset -q --hard origin/main || return 1
+    cp -a "$T"/data/. data/ || return 1
+    cp -a "$T"/latest.json "$T"/holders.json . || return 1
     rm -rf "$T"
     git add -A data latest.json holders.json
     git diff --staged --quiet || git commit -q -m "$MSG"
@@ -65,9 +70,11 @@ RC=$?
 
 # 새 스냅샷이 실제로 생겼을 때만 디스코드로 보낸다.
 # collect.py 가 --min-gap 으로 건너뛰면 보낼 것이 없다.
-if [ "$BEFORE" != "$(newest)" ]; then
+if [ "$BEFORE" != "$AFTER" ]; then
   # 전송이 실패해도 수집은 이미 끝났다. 종료 코드에 영향을 주지 않는다.
-  python3 vps/report.py --out /tmp/liqmap.png || echo "리포트 실패"
+  REPORT_ARGS=(--out /tmp/liqmap.png --snapshot "$AFTER")
+  [ "$RC" -ne 0 ] && REPORT_ARGS+=(--github-failed)
+  python3 vps/report.py "${REPORT_ARGS[@]}" || echo "리포트 실패"
 else
   echo "새 스냅샷 없음 — 리포트 건너뜀"
 fi
