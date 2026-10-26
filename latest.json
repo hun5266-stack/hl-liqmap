@@ -1,23 +1,23 @@
 {
-  "ts": "2026-10-26T03:26:37.095251+00:00",
-  "price": 79695.0,
+  "ts": "2026-10-26T04:26:39.524715+00:00",
+  "price": 79863.0,
   "mode": "full",
-  "scanned": 47657,
-  "btc_positions": 3357,
-  "long_btc": 17202.4,
-  "short_btc": 17574.23,
-  "long_n": 2179,
-  "short_n": 1178,
-  "elapsed_s": 1591,
+  "scanned": 47639,
+  "btc_positions": 3367,
+  "long_btc": 17403.15,
+  "short_btc": 17605.56,
+  "long_n": 2191,
+  "short_n": 1176,
+  "elapsed_s": 1594,
   "complete": false,
   "counts": {
-    "requested": 47657,
-    "ok_btc": 3357,
-    "ok_no_btc": 44253,
-    "failed": 47,
-    "recovered": 2562,
-    "attempts": 59685
+    "requested": 47639,
+    "ok_btc": 3367,
+    "ok_no_btc": 44262,
+    "failed": 10,
+    "recovered": 2627,
+    "attempts": 59715
   },
-  "started_at": "2026-10-26T03:00:06.068994+00:00",
-  "price_at": 1792985197094
+  "started_at": "2026-10-26T04:00:05.939923+00:00",
+  "price_at": 1792988799524
 }
